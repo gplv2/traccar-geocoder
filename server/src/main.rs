@@ -370,10 +370,15 @@ impl Index {
         // For each admin level, find the smallest-area polygon containing the point
         let mut best_by_level: [Option<(f32, &AdminPolygon)>; 12] = [None; 12];
 
+        const INTERIOR_FLAG: u32 = 0x80000000;
+        const ID_MASK: u32 = 0x7FFFFFFF;
+
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             let ids = Self::lookup_cell_ids(&self.admin_cells, &self.admin_entries, c);
             for id in ids {
-                let poly = &all_polygons[id as usize];
+                let is_interior = (id & INTERIOR_FLAG) != 0;
+                let poly_id = (id & ID_MASK) as usize;
+                let poly = &all_polygons[poly_id];
                 let level = poly.admin_level as usize;
                 if level >= 12 { continue; }
 
@@ -382,11 +387,12 @@ impl Index {
                     if poly.area >= best_area { continue; }
                 }
 
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                let vertices = &all_vertices[offset..offset + count];
-
-                if point_in_polygon(lat as f32, lng as f32, vertices) {
+                // Interior cells skip point-in-polygon test
+                if is_interior || point_in_polygon(lat as f32, lng as f32, {
+                    let offset = poly.vertex_offset as usize;
+                    let count = poly.vertex_count as usize;
+                    &all_vertices[offset..offset + count]
+                }) {
                     best_by_level[level] = Some((poly.area, poly));
                 }
             }

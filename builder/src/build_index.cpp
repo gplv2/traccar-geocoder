@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <osmium/handler.hpp>
@@ -60,6 +61,9 @@ struct NodeCoord {
     float lat;
     float lng;
 };
+
+static const uint32_t INTERIOR_FLAG = 0x80000000u;
+static const uint32_t ID_MASK = 0x7FFFFFFFu;
 
 // --- String interning ---
 
@@ -131,7 +135,8 @@ static S2CellId point_to_cell(double lat, double lng) {
     return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel);
 }
 
-static std::vector<S2CellId> cover_polygon(const std::vector<std::pair<double,double>>& vertices) {
+// Returns pairs of (cell_id, is_interior)
+static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair<double,double>>& vertices) {
     std::vector<S2Point> points;
     points.reserve(vertices.size());
     for (const auto& [lat, lng] : vertices) {
@@ -150,26 +155,56 @@ static std::vector<S2CellId> cover_polygon(const std::vector<std::pair<double,do
 
     S2RegionCoverer coverer(options);
     S2CellUnion covering = coverer.GetCovering(polygon);
+    S2CellUnion interior = coverer.GetInteriorCovering(polygon);
 
-    // Normalize all cells to kAdminCellLevel
-    std::vector<S2CellId> result;
-    for (const auto& cell : covering.cell_ids()) {
+    // Build set of interior cell IDs for fast lookup
+    std::unordered_set<uint64_t> interior_set;
+    for (const auto& cell : interior.cell_ids()) {
         if (cell.level() <= kAdminCellLevel) {
-            // Expand to children at kAdminCellLevel
             auto begin = cell.range_min().parent(kAdminCellLevel);
             auto end = cell.range_max().parent(kAdminCellLevel);
             for (auto c = begin; c != end; c = c.next()) {
-                result.push_back(c);
+                interior_set.insert(c.id());
             }
-            result.push_back(end);
+            interior_set.insert(end.id());
         } else {
-            result.push_back(cell.parent(kAdminCellLevel));
+            interior_set.insert(cell.parent(kAdminCellLevel).id());
         }
     }
 
-    // Deduplicate
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
+    // Normalize all covering cells to kAdminCellLevel
+    std::vector<std::pair<S2CellId, bool>> result;
+    for (const auto& cell : covering.cell_ids()) {
+        if (cell.level() <= kAdminCellLevel) {
+            auto begin = cell.range_min().parent(kAdminCellLevel);
+            auto end = cell.range_max().parent(kAdminCellLevel);
+            for (auto c = begin; c != end; c = c.next()) {
+                result.emplace_back(c, interior_set.count(c.id()) > 0);
+            }
+            result.emplace_back(end, interior_set.count(end.id()) > 0);
+        } else {
+            auto parent = cell.parent(kAdminCellLevel);
+            result.emplace_back(parent, interior_set.count(parent.id()) > 0);
+        }
+    }
+
+    // Deduplicate by cell_id, keeping interior=true if any duplicate is interior
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+    auto it = result.begin();
+    for (auto curr = result.begin(); curr != result.end(); ) {
+        auto next = curr + 1;
+        bool is_interior = curr->second;
+        while (next != result.end() && next->first == curr->first) {
+            is_interior = is_interior || next->second;
+            ++next;
+        }
+        *it = {curr->first, is_interior};
+        ++it;
+        curr = next;
+    }
+    result.erase(it, result.end());
     return result;
 }
 
@@ -330,10 +365,11 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
     poly.area = polygon_area(simplified);
     admin_polygons.push_back(poly);
 
-    // S2 cell coverage
+    // S2 cell coverage (high bit marks interior cells)
     auto cell_ids = cover_polygon(simplified);
-    for (const auto& cell_id : cell_ids) {
-        cell_to_admin[cell_id.id()].push_back(poly_id);
+    for (const auto& [cell_id, is_interior] : cell_ids) {
+        uint32_t entry = is_interior ? (poly_id | INTERIOR_FLAG) : poly_id;
+        cell_to_admin[cell_id.id()].push_back(entry);
     }
 }
 
