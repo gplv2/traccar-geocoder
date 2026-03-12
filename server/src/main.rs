@@ -3,6 +3,7 @@ use memmap2::Mmap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs::File;
 use std::sync::Arc;
 
@@ -204,7 +205,7 @@ impl Index {
 
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
-    fn query_geo(&self, lat: f64, lng: f64) -> (Option<(f64, &AddrPoint)>, Option<(f64, String, u32)>, Option<(f64, &WayHeader)>) {
+    fn query_geo(&self, lat: f64, lng: f64) -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader)>) {
         let cell = cell_id_at_level(lat, lng, STREET_CELL_LEVEL);
         let neighbors = cell_neighbors_at_level(cell, STREET_CELL_LEVEL);
 
@@ -351,8 +352,7 @@ impl Index {
                 raw.round() as u32
             };
 
-            let street = self.get_string(iw.street_id).to_string();
-            (best_interp_dist, street, number)
+            (best_interp_dist, self.get_string(iw.street_id), number)
         });
 
         (addr_result, interp_result, street_result)
@@ -360,7 +360,7 @@ impl Index {
 
     // --- Admin boundary lookup (point-in-polygon) ---
 
-    fn find_admin(&self, lat: f64, lng: f64) -> AdminResult {
+    fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
         let cell = cell_id_at_level(lat, lng, ADMIN_CELL_LEVEL);
         let neighbors = cell_neighbors_at_level(cell, ADMIN_CELL_LEVEL);
 
@@ -411,7 +411,7 @@ impl Index {
 
         for level in 0..12 {
             if let Some((_, poly)) = best_by_level[level] {
-                let name = self.get_string(poly.name_id).to_string();
+                let name = self.get_string(poly.name_id);
                 match poly.admin_level {
                     2 => result.country = Some(name),
                     4 => result.state = Some(name),
@@ -428,7 +428,7 @@ impl Index {
 
     // --- Combined query ---
 
-    fn query(&self, lat: f64, lng: f64) -> Address {
+    fn query(&self, lat: f64, lng: f64) -> Address<'_> {
         let max_addr_dist = 0.0005 * 0.0005; // ~50m, squared
         let max_street_dist = 0.0007 * 0.0007; // ~75m, squared
 
@@ -439,8 +439,8 @@ impl Index {
         if let Some((dist, point)) = addr {
             if dist < max_addr_dist {
                 return Address {
-                    housenumber: Some(self.get_string(point.housenumber_id).to_string()),
-                    street: Some(self.get_string(point.street_id).to_string()),
+                    housenumber: Some(Cow::Borrowed(self.get_string(point.housenumber_id))),
+                    street: Some(self.get_string(point.street_id)),
                     city: admin.city,
                     state: admin.state,
                     postcode: admin.postcode,
@@ -453,7 +453,7 @@ impl Index {
         if let Some((dist, street_name, number)) = interp {
             if dist < max_addr_dist {
                 return Address {
-                    housenumber: Some(number.to_string()),
+                    housenumber: Some(Cow::Owned(number.to_string())),
                     street: Some(street_name),
                     city: admin.city,
                     state: admin.state,
@@ -468,7 +468,7 @@ impl Index {
             if dist < max_street_dist {
                 return Address {
                     housenumber: None,
-                    street: Some(self.get_string(way.name_id).to_string()),
+                    street: Some(self.get_string(way.name_id)),
                     city: admin.city,
                     state: admin.state,
                     postcode: admin.postcode,
@@ -555,28 +555,28 @@ fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
 // --- API types ---
 
 #[derive(Default)]
-struct AdminResult {
-    country: Option<String>,
-    state: Option<String>,
-    county: Option<String>,
-    city: Option<String>,
-    postcode: Option<String>,
+struct AdminResult<'a> {
+    country: Option<&'a str>,
+    state: Option<&'a str>,
+    county: Option<&'a str>,
+    city: Option<&'a str>,
+    postcode: Option<&'a str>,
 }
 
 #[derive(Serialize, Default)]
-struct Address {
+struct Address<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    housenumber: Option<String>,
+    housenumber: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    street: Option<String>,
+    street: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    city: Option<String>,
+    city: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<String>,
+    state: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    postcode: Option<String>,
+    postcode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    country: Option<String>,
+    country: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -588,8 +588,10 @@ struct QueryParams {
 async fn reverse_geocode(
     Query(params): Query<QueryParams>,
     index: axum::extract::State<Arc<Index>>,
-) -> axum::Json<Address> {
-    axum::Json(index.query(params.lat, params.lng))
+) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+    let address = index.query(params.lat, params.lng);
+    let json = serde_json::to_string(&address).unwrap_or_default();
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], json)
 }
 
 #[tokio::main]
