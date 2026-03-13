@@ -697,14 +697,20 @@ async fn reverse_geocode(
     Query(params): Query<QueryParams>,
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
     index: axum::extract::Extension<Arc<Index>>,
+    limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
 ) -> Response {
     let key = match params.key {
         Some(k) => k,
         None => return (StatusCode::UNAUTHORIZED, "Missing API key").into_response(),
     };
 
-    if !state.read().unwrap().validate_token(&key) {
-        return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response();
+    let (login, rps, rpd) = match state.read().unwrap().validate_token(&key) {
+        Some(info) => info,
+        None => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
+    };
+
+    if let Err(msg) = auth::check_rate(&limiter, &login, rps, rpd) {
+        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
 
     let address = index.query(params.lat, params.lon);
@@ -730,11 +736,13 @@ async fn main() {
     };
 
     let db = Arc::new(RwLock::new(db));
+    let limiter = Arc::new(auth::RateLimiter::default()); // RwLock<HashMap> with atomic counters
 
     let app = Router::new()
         .route("/reverse", get(reverse_geocode))
-        .layer(axum::Extension(index))
         .merge(auth::router())
+        .layer(axum::Extension(index))
+        .layer(axum::Extension(limiter))
         .with_state(db);
 
     // ACME mode: --domain <domain> [--cache <dir>]
