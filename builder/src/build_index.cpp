@@ -547,6 +547,7 @@ private:
         iw.interpolation = interp_type;
         interp_ways.push_back(iw);
 
+        std::unordered_set<uint64_t> interp_cells;
         for (size_t i = 0; i + 1 < wnodes.size(); i++) {
             double lat1 = wnodes[i].location().lat();
             double lng1 = wnodes[i].location().lon();
@@ -555,8 +556,11 @@ private:
 
             auto cell_ids = cover_edge(lat1, lng1, lat2, lng2);
             for (const auto& cell_id : cell_ids) {
-                cell_to_interps[cell_id.id()].push_back(interp_id);
+                interp_cells.insert(cell_id.id());
             }
+        }
+        for (uint64_t cell_id : interp_cells) {
+            cell_to_interps[cell_id].push_back(interp_id);
         }
 
         interp_count_++;
@@ -586,6 +590,7 @@ private:
         header.name_id = strings.intern(name);
         ways.push_back(header);
 
+        std::unordered_set<uint64_t> way_cells;
         for (size_t i = 0; i + 1 < wnodes.size(); i++) {
             double lat1 = wnodes[i].location().lat();
             double lng1 = wnodes[i].location().lon();
@@ -594,8 +599,11 @@ private:
 
             auto cell_ids = cover_edge(lat1, lng1, lat2, lng2);
             for (const auto& cell_id : cell_ids) {
-                cell_to_ways[cell_id.id()].push_back(way_id);
+                way_cells.insert(cell_id.id());
             }
+        }
+        for (uint64_t cell_id : way_cells) {
+            cell_to_ways[cell_id].push_back(way_id);
         }
 
         way_count_++;
