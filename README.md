@@ -102,6 +102,10 @@ Status codes:
 - `401` - missing or invalid API key
 - `429` - rate limit exceeded
 
+### Authentication
+
+The server includes a web dashboard for managing API keys. On first launch, navigate to the server URL in a browser to create an admin account. Once logged in, you can generate API keys and create additional users with configurable rate limits.
+
 ## Architecture
 
 The project consists of two components:
