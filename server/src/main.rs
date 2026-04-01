@@ -99,6 +99,14 @@ struct Index {
     admin_cell_level: u64,
     max_distance_sq: f64,
     country_boundaries: CountryBoundaries,
+    // Precomputed slice lengths to avoid per-query division
+    addr_point_count: usize,
+    street_way_count: usize,
+    street_node_count: usize,
+    interp_way_count: usize,
+    interp_node_count: usize,
+    admin_polygon_count: usize,
+    admin_vertex_count: usize,
 }
 
 const NO_DATA: u32 = 0xFFFFFFFF;
@@ -118,26 +126,47 @@ impl Index {
     fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         let meters_to_rad = search_distance / 111_320.0;
         let max_distance_sq = meters_to_rad * meters_to_rad;
+        let addr_points = mmap_file(&format!("{}/addr_points.bin", dir))?;
+        let street_ways = mmap_file(&format!("{}/street_ways.bin", dir))?;
+        let street_nodes = mmap_file(&format!("{}/street_nodes.bin", dir))?;
+        let interp_ways = mmap_file(&format!("{}/interp_ways.bin", dir))?;
+        let interp_nodes = mmap_file(&format!("{}/interp_nodes.bin", dir))?;
+        let admin_polygons = mmap_file(&format!("{}/admin_polygons.bin", dir))?;
+        let admin_vertices = mmap_file(&format!("{}/admin_vertices.bin", dir))?;
+        let addr_point_count = addr_points.len() / std::mem::size_of::<AddrPoint>();
+        let street_way_count = street_ways.len() / std::mem::size_of::<WayHeader>();
+        let street_node_count = street_nodes.len() / std::mem::size_of::<NodeCoord>();
+        let interp_way_count = interp_ways.len() / std::mem::size_of::<InterpWay>();
+        let interp_node_count = interp_nodes.len() / std::mem::size_of::<NodeCoord>();
+        let admin_polygon_count = admin_polygons.len() / std::mem::size_of::<AdminPolygon>();
+        let admin_vertex_count = admin_vertices.len() / std::mem::size_of::<NodeCoord>();
         Ok(Index {
             geo_cells: mmap_file(&format!("{}/geo_cells.bin", dir))?,
             street_entries: mmap_file(&format!("{}/street_entries.bin", dir))?,
-            street_ways: mmap_file(&format!("{}/street_ways.bin", dir))?,
-            street_nodes: mmap_file(&format!("{}/street_nodes.bin", dir))?,
+            street_ways,
+            street_nodes,
             addr_entries: mmap_file(&format!("{}/addr_entries.bin", dir))?,
-            addr_points: mmap_file(&format!("{}/addr_points.bin", dir))?,
+            addr_points,
             interp_entries: mmap_file(&format!("{}/interp_entries.bin", dir))?,
-            interp_ways: mmap_file(&format!("{}/interp_ways.bin", dir))?,
-            interp_nodes: mmap_file(&format!("{}/interp_nodes.bin", dir))?,
+            interp_ways,
+            interp_nodes,
             admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
-            admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
-            admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
+            admin_polygons,
+            admin_vertices,
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
             country_boundaries: CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180)
                 .map_err(|e| format!("Failed to load country boundaries: {}", e))?,
+            addr_point_count,
+            street_way_count,
+            street_node_count,
+            interp_way_count,
+            interp_node_count,
+            admin_polygon_count,
+            admin_vertex_count,
         })
     }
 
@@ -232,31 +261,31 @@ impl Index {
         let all_points: &[AddrPoint] = unsafe {
             std::slice::from_raw_parts(
                 self.addr_points.as_ptr() as *const AddrPoint,
-                self.addr_points.len() / std::mem::size_of::<AddrPoint>(),
+                self.addr_point_count,
             )
         };
         let all_ways: &[WayHeader] = unsafe {
             std::slice::from_raw_parts(
                 self.street_ways.as_ptr() as *const WayHeader,
-                self.street_ways.len() / std::mem::size_of::<WayHeader>(),
+                self.street_way_count,
             )
         };
         let all_street_nodes: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.street_nodes.as_ptr() as *const NodeCoord,
-                self.street_nodes.len() / std::mem::size_of::<NodeCoord>(),
+                self.street_node_count,
             )
         };
         let all_interps: &[InterpWay] = unsafe {
             std::slice::from_raw_parts(
                 self.interp_ways.as_ptr() as *const InterpWay,
-                self.interp_ways.len() / std::mem::size_of::<InterpWay>(),
+                self.interp_way_count,
             )
         };
         let all_interp_nodes: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.interp_nodes.as_ptr() as *const NodeCoord,
-                self.interp_nodes.len() / std::mem::size_of::<NodeCoord>(),
+                self.interp_node_count,
             )
         };
 
@@ -394,13 +423,13 @@ impl Index {
         let all_polygons: &[AdminPolygon] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+                self.admin_polygon_count,
             )
         };
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertex_count,
             )
         };
 
