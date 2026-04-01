@@ -17,38 +17,37 @@ download_pbf() {
 }
 
 build_index() {
-    files=""
+    set -- "$DATA_DIR/index"
     for f in "$DATA_DIR"/pbf/*.osm.pbf; do
-        [ -f "$f" ] && files="$files $f"
+        [ -f "$f" ] && set -- "$@" "$f"
     done
-    if [ -z "$files" ]; then
+    if [ "$#" -eq 1 ]; then
         echo "Error: no PBF files found in $DATA_DIR/pbf/"
         exit 1
     fi
     mkdir -p "$DATA_DIR/index"
-    level_args=""
-    [ -n "$STREET_LEVEL" ] && level_args="$level_args --street-level $STREET_LEVEL"
-    [ -n "$ADMIN_LEVEL" ] && level_args="$level_args --admin-level $ADMIN_LEVEL"
+    [ -n "$STREET_LEVEL" ] && set -- "$@" --street-level "$STREET_LEVEL"
+    [ -n "$ADMIN_LEVEL" ] && set -- "$@" --admin-level "$ADMIN_LEVEL"
     echo "Building index..."
-    build-index "$DATA_DIR/index" $files $level_args
+    build-index "$@"
     echo "Index built."
 }
 
 serve() {
-    args="$DATA_DIR/index"
+    set -- "$DATA_DIR/index"
     if [ -n "$DOMAIN" ]; then
-        args="$args --domain $DOMAIN"
+        set -- "$@" --domain "$DOMAIN"
         if [ -n "$CACHE_DIR" ]; then
-            args="$args --cache $CACHE_DIR"
+            set -- "$@" --cache "$CACHE_DIR"
         fi
     else
-        args="$args ${BIND_ADDR:-0.0.0.0:3000}"
+        set -- "$@" "${BIND_ADDR:-0.0.0.0:3000}"
     fi
-    [ -n "$STREET_LEVEL" ] && args="$args --street-level $STREET_LEVEL"
-    [ -n "$ADMIN_LEVEL" ] && args="$args --admin-level $ADMIN_LEVEL"
-    [ -n "$SEARCH_DISTANCE" ] && args="$args --search-distance $SEARCH_DISTANCE"
+    [ -n "$STREET_LEVEL" ] && set -- "$@" --street-level "$STREET_LEVEL"
+    [ -n "$ADMIN_LEVEL" ] && set -- "$@" --admin-level "$ADMIN_LEVEL"
+    [ -n "$SEARCH_DISTANCE" ] && set -- "$@" --search-distance "$SEARCH_DISTANCE"
     echo "Starting server..."
-    exec query-server $args
+    exec query-server "$@"
 }
 
 case "${1:-auto}" in
