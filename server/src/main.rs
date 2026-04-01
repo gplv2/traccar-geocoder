@@ -1028,6 +1028,13 @@ async fn reverse_geocode(
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
 
+    if !params.lat.is_finite() || !params.lon.is_finite()
+        || params.lat < -90.0 || params.lat > 90.0
+        || params.lon < -180.0 || params.lon > 180.0
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid coordinates").into_response();
+    }
+
     let address = index.query(params.lat, params.lon);
     let json = serde_json::to_string(&address).unwrap_or_default();
     ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
