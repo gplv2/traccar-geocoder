@@ -8,6 +8,7 @@ use axum::Router;
 use memmap2::Mmap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
+use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs::File;
@@ -97,6 +98,7 @@ struct Index {
     street_cell_level: u64,
     admin_cell_level: u64,
     max_distance_sq: f64,
+    country_boundaries: CountryBoundaries,
 }
 
 const NO_DATA: u32 = 0xFFFFFFFF;
@@ -134,6 +136,8 @@ impl Index {
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
+            country_boundaries: CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180)
+                .map_err(|e| format!("Failed to load country boundaries: {}", e))?,
         })
     }
 
@@ -462,8 +466,24 @@ impl Index {
     fn query(&self, lat: f64, lng: f64) -> Address<'_> {
         let max_dist = self.max_distance_sq;
 
-        let admin = self.find_admin(lat, lng);
+        let mut admin = self.find_admin(lat, lng);
         let (addr, interp, street) = self.query_geo(lat, lng);
+
+        // Fallback: use country-boundaries crate when S2 admin lookup has no country
+        if admin.country.is_none() {
+            if let Ok(latlon) = LatLon::new(lat, lng) {
+                for id in self.country_boundaries.ids(latlon) {
+                    if id.len() == 2 {
+                        let b0 = id.as_bytes()[0].to_ascii_uppercase();
+                        let b1 = id.as_bytes()[1].to_ascii_uppercase();
+                        admin.country_code = Some([b0, b1]);
+                        let upper = id.to_ascii_uppercase();
+                        admin.country = country_code_to_name(&upper);
+                        break;
+                    }
+                }
+            }
+        }
 
         // Determine house_number and road from best geo match (priority: address > interpolation > street)
         let mut house_number: Option<Cow<'_, str>> = None;
@@ -567,6 +587,60 @@ fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     }
 
     inside
+}
+
+// --- Country code fallback ---
+
+fn country_code_to_name(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "AD" => "Andorra",
+        "AL" => "Shqipëria",
+        "AT" => "Österreich",
+        "BA" => "Bosna i Hercegovina",
+        "BE" => "België / Belgique / Belgien",
+        "BG" => "България",
+        "BY" => "Беларусь",
+        "CH" => "Schweiz/Suisse/Svizzera",
+        "CY" => "Κύπρος",
+        "CZ" => "Česko",
+        "DE" => "Deutschland",
+        "DK" => "Danmark",
+        "EE" => "Eesti",
+        "ES" => "España",
+        "FI" => "Suomi",
+        "FR" => "France",
+        "GB" => "United Kingdom",
+        "GR" => "Ελλάς",
+        "HR" => "Hrvatska",
+        "HU" => "Magyarország",
+        "IE" => "Ireland",
+        "IS" => "Ísland",
+        "IT" => "Italia",
+        "LI" => "Liechtenstein",
+        "LT" => "Lietuva",
+        "LU" => "Luxembourg",
+        "LV" => "Latvija",
+        "MC" => "Monaco",
+        "MD" => "Moldova",
+        "ME" => "Crna Gora",
+        "MK" => "Северна Македонија",
+        "MT" => "Malta",
+        "NL" => "Nederland",
+        "NO" => "Norge",
+        "PL" => "Polska",
+        "PT" => "Portugal",
+        "RO" => "România",
+        "RS" => "Србија",
+        "SE" => "Sverige",
+        "SI" => "Slovenija",
+        "SK" => "Slovensko",
+        "SM" => "San Marino",
+        "TR" => "Türkiye",
+        "UA" => "Україна",
+        "VA" => "Città del Vaticano",
+        "XK" => "Kosovë",
+        _ => return None,
+    })
 }
 
 // --- API types ---
