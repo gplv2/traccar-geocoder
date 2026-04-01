@@ -170,7 +170,7 @@ impl Index {
     }
 
     fn get_string(&self, offset: u32) -> &str {
-        let bytes = &self.strings[offset as usize..];
+        let Some(bytes) = self.strings.get(offset as usize..) else { return ""; };
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         std::str::from_utf8(&bytes[..end]).unwrap_or("")
     }
@@ -306,7 +306,7 @@ impl Index {
 
             // Addresses
             Self::for_each_entry(&self.addr_entries, offsets.addr, |id| {
-                let point = &all_points[id as usize];
+                let Some(point) = all_points.get(id as usize) else { return; };
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let dist = dist_sq(dlat, dlng, cos_lat);
@@ -322,10 +322,10 @@ impl Index {
                 if seen_streets[slot] == id { return; }
                 seen_streets[slot] = id;
 
-                let way = &all_ways[id as usize];
+                let Some(way) = all_ways.get(id as usize) else { return; };
                 let offset = way.node_offset as usize;
                 let count = way.node_count as usize;
-                let nodes = &all_street_nodes[offset..offset + count];
+                let Some(nodes) = all_street_nodes.get(offset..offset + count) else { return; };
 
                 for i in 0..nodes.len() - 1 {
                     let dist = point_to_segment_distance(
@@ -343,12 +343,12 @@ impl Index {
 
             // Interpolation
             Self::for_each_entry(&self.interp_entries, offsets.interp, |id| {
-                let iw = &all_interps[id as usize];
+                let Some(iw) = all_interps.get(id as usize) else { return; };
                 if iw.start_number == 0 || iw.end_number == 0 { return; }
 
                 let offset = iw.node_offset as usize;
                 let count = iw.node_count as usize;
-                let nodes = &all_interp_nodes[offset..offset + count];
+                let Some(nodes) = all_interp_nodes.get(offset..offset + count) else { return; };
 
                 let mut total_len: f64 = 0.0;
                 for i in 0..nodes.len() - 1 {
@@ -442,7 +442,7 @@ impl Index {
             Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
                 let poly_id = (id & ID_MASK) as usize;
-                let poly = &all_polygons[poly_id];
+                let Some(poly) = all_polygons.get(poly_id) else { return; };
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
 
@@ -452,11 +452,10 @@ impl Index {
                 }
 
                 // Interior cells skip point-in-polygon test
-                if is_interior || point_in_polygon(lat as f32, lng as f32, {
-                    let offset = poly.vertex_offset as usize;
-                    let count = poly.vertex_count as usize;
-                    &all_vertices[offset..offset + count]
-                }) {
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                let Some(vertices) = all_vertices.get(offset..offset + count) else { return; };
+                if is_interior || point_in_polygon(lat as f32, lng as f32, vertices) {
                     best_by_level[level] = Some((poly.area, poly));
                 }
             });
