@@ -25,9 +25,8 @@ fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     CellID::from(ll).parent(level).0
 }
 
-fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
-    let cell = CellID(cell_id);
-    cell.all_neighbors(level).into_iter().map(|c| c.0).collect()
+fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<CellID> {
+    CellID(cell_id).all_neighbors(level)
 }
 
 // --- Binary format structs (must match C++ build pipeline) ---
@@ -302,7 +301,7 @@ impl Index {
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 256] = [u32::MAX; 256];
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        for c in std::iter::once(cell).chain(neighbors.into_iter().map(|c| c.0)) {
             let offsets = Self::lookup_geo_cell(&self.geo_cells, c);
 
             // Addresses
@@ -439,7 +438,7 @@ impl Index {
         const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        for c in std::iter::once(cell).chain(neighbors.into_iter().map(|c| c.0)) {
             Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
                 let poly_id = (id & ID_MASK) as usize;
