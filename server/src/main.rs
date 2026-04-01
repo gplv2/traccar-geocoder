@@ -928,66 +928,71 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     }
 
     let (number_after, postcode_before_city, include_state) = format_rules(addr.country_code.as_deref());
-    let mut parts: Vec<String> = Vec::new();
+    let mut result = String::with_capacity(200);
 
     // Street + house number
     if let Some(road) = addr.road {
         if let Some(ref hn) = addr.house_number {
             if number_after {
-                parts.push(format!("{} {}", road, hn));
+                result.push_str(road);
+                result.push(' ');
+                result.push_str(hn);
             } else {
-                parts.push(format!("{} {}", hn, road));
+                result.push_str(hn);
+                result.push(' ');
+                result.push_str(road);
             }
         } else {
-            parts.push(road.to_string());
+            result.push_str(road);
         }
     }
 
-    // City + postcode + state
+    // City + postcode + state: optimistically write separator, truncate if block is empty
+    let before_city = result.len();
+    if !result.is_empty() { result.push_str(", "); }
+    let city_block_start = result.len();
+
     if postcode_before_city {
-        let mut city_part = String::new();
         if let Some(pc) = addr.postcode {
-            city_part.push_str(pc);
-            city_part.push(' ');
+            result.push_str(pc);
         }
         if let Some(city) = addr.city {
-            city_part.push_str(city);
+            if result.len() > city_block_start { result.push(' '); }
+            result.push_str(city);
         }
         if include_state {
             if let Some(state) = addr.state {
-                if !city_part.is_empty() { city_part.push_str(", "); }
-                city_part.push_str(state);
+                if result.len() > city_block_start { result.push_str(", "); }
+                result.push_str(state);
             }
-        }
-        if !city_part.is_empty() {
-            parts.push(city_part.trim().to_string());
         }
     } else {
-        let mut city_part = String::new();
         if let Some(city) = addr.city {
-            city_part.push_str(city);
+            result.push_str(city);
         }
         if include_state {
             if let Some(state) = addr.state {
-                if !city_part.is_empty() { city_part.push_str(", "); }
-                city_part.push_str(state);
+                if result.len() > city_block_start { result.push_str(", "); }
+                result.push_str(state);
             }
         }
         if let Some(pc) = addr.postcode {
-            if !city_part.is_empty() { city_part.push(' '); }
-            city_part.push_str(pc);
+            if result.len() > city_block_start { result.push(' '); }
+            result.push_str(pc);
         }
-        if !city_part.is_empty() {
-            parts.push(city_part);
-        }
+    }
+
+    if result.len() == city_block_start {
+        result.truncate(before_city);
     }
 
     // Country
     if let Some(country) = addr.country {
-        parts.push(country.to_string());
+        if !result.is_empty() { result.push_str(", "); }
+        result.push_str(country);
     }
 
-    if parts.is_empty() { None } else { Some(parts.join(", ")) }
+    if result.is_empty() { None } else { Some(result) }
 }
 
 #[derive(Deserialize)]
