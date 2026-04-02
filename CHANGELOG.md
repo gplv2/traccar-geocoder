@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-04-02
+## [2.0.0] - 2026-04-02
 
 ### Added
 
@@ -64,10 +64,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Updated aws-lc-sys 0.38.0 to 0.39.1 (RUSTSEC-2026-0044, RUSTSEC-2026-0048: X.509 name constraints bypass, CRL scope check, severity 7.4 high)
 - Updated rustls-webpki 0.103.9 to 0.103.10 (RUSTSEC-2026-0049: CRL distribution point matching)
 
-## [1.0.0] - 2026-04-01
+## [0.1.0] - 2026-04-01
 
 Initial fork from [traccar/traccar-geocoder](https://github.com/traccar/traccar-geocoder) at commit `6feb14e`.
 
 ### Added
-- Country-boundaries fallback for missing country data (later refined in 1.1.0)
+- Country-boundaries fallback for missing country data (later refined in 2.0.0)
 - Worldwide country code to name mapping (~250 entries)
