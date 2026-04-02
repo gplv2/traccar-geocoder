@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // --- Data model ---
@@ -24,20 +23,26 @@ pub struct User {
     rate_by_ip: bool,
 }
 
+struct RateInner {
+    second_count: u32,
+    second_ts: u64,
+    day_count: u32,
+    day_ts: u32,
+}
+
 pub struct RateState {
-    second_count: AtomicU32,
-    second_ts: AtomicU64,
-    day_count: AtomicU32,
-    day_ts: AtomicU32,
+    inner: Mutex<RateInner>,
 }
 
 impl Default for RateState {
     fn default() -> Self {
         Self {
-            second_count: AtomicU32::new(0),
-            second_ts: AtomicU64::new(0),
-            day_count: AtomicU32::new(0),
-            day_ts: AtomicU32::new(0),
+            inner: Mutex::new(RateInner {
+                second_count: 0,
+                second_ts: 0,
+                day_count: 0,
+                day_ts: 0,
+            }),
         }
     }
 }
@@ -104,19 +109,24 @@ pub fn check_rate(limiter: &RateLimiter, login: &str, rate_per_second: u32, rate
     let now_secs = now.as_secs();
     let now_day = (now_secs / 86400) as u32;
 
-    if state.second_ts.load(Relaxed) != now_secs {
-        state.second_ts.store(now_secs, Relaxed);
-        state.second_count.store(0, Relaxed);
+    let mut rate = state.inner.lock().unwrap();
+
+    if rate.second_ts != now_secs {
+        rate.second_ts = now_secs;
+        rate.second_count = 0;
     }
-    if state.day_ts.load(Relaxed) != now_day {
-        state.day_ts.store(now_day, Relaxed);
-        state.day_count.store(0, Relaxed);
+    if rate.day_ts != now_day {
+        rate.day_ts = now_day;
+        rate.day_count = 0;
     }
 
-    if rate_per_second > 0 && state.second_count.fetch_add(1, Relaxed) >= rate_per_second {
+    rate.second_count += 1;
+    if rate_per_second > 0 && rate.second_count > rate_per_second {
         return Err("Rate limit exceeded (per second)");
     }
-    if rate_per_day > 0 && state.day_count.fetch_add(1, Relaxed) >= rate_per_day {
+
+    rate.day_count += 1;
+    if rate_per_day > 0 && rate.day_count > rate_per_day {
         return Err("Rate limit exceeded (per day)");
     }
 
@@ -261,7 +271,8 @@ async fn dashboard(
     let daily_usage = {
         let map = limiter.read().unwrap();
         map.get(&login).map(|s| {
-            if s.day_ts.load(Relaxed) == now_day { s.day_count.load(Relaxed) } else { 0 }
+            let rate = s.inner.lock().unwrap();
+            if rate.day_ts == now_day { rate.day_count } else { 0 }
         }).unwrap_or(0)
     };
 

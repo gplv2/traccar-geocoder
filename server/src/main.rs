@@ -8,7 +8,6 @@ use axum::Router;
 use memmap2::Mmap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
-use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs::File;
@@ -25,9 +24,8 @@ fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     CellID::from(ll).parent(level).0
 }
 
-fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
-    let cell = CellID(cell_id);
-    cell.all_neighbors(level).into_iter().map(|c| c.0).collect()
+fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<CellID> {
+    CellID(cell_id).all_neighbors(level)
 }
 
 // --- Binary format structs (must match C++ build pipeline) ---
@@ -98,7 +96,14 @@ struct Index {
     street_cell_level: u64,
     admin_cell_level: u64,
     max_distance_sq: f64,
-    country_boundaries: CountryBoundaries,
+    // Precomputed slice lengths to avoid per-query division
+    addr_point_count: usize,
+    street_way_count: usize,
+    street_node_count: usize,
+    interp_way_count: usize,
+    interp_node_count: usize,
+    admin_polygon_count: usize,
+    admin_vertex_count: usize,
 }
 
 const NO_DATA: u32 = 0xFFFFFFFF;
@@ -118,31 +123,50 @@ impl Index {
     fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         let meters_to_rad = search_distance / 111_320.0;
         let max_distance_sq = meters_to_rad * meters_to_rad;
+        let addr_points = mmap_file(&format!("{}/addr_points.bin", dir))?;
+        let street_ways = mmap_file(&format!("{}/street_ways.bin", dir))?;
+        let street_nodes = mmap_file(&format!("{}/street_nodes.bin", dir))?;
+        let interp_ways = mmap_file(&format!("{}/interp_ways.bin", dir))?;
+        let interp_nodes = mmap_file(&format!("{}/interp_nodes.bin", dir))?;
+        let admin_polygons = mmap_file(&format!("{}/admin_polygons.bin", dir))?;
+        let admin_vertices = mmap_file(&format!("{}/admin_vertices.bin", dir))?;
+        let addr_point_count = addr_points.len() / std::mem::size_of::<AddrPoint>();
+        let street_way_count = street_ways.len() / std::mem::size_of::<WayHeader>();
+        let street_node_count = street_nodes.len() / std::mem::size_of::<NodeCoord>();
+        let interp_way_count = interp_ways.len() / std::mem::size_of::<InterpWay>();
+        let interp_node_count = interp_nodes.len() / std::mem::size_of::<NodeCoord>();
+        let admin_polygon_count = admin_polygons.len() / std::mem::size_of::<AdminPolygon>();
+        let admin_vertex_count = admin_vertices.len() / std::mem::size_of::<NodeCoord>();
         Ok(Index {
             geo_cells: mmap_file(&format!("{}/geo_cells.bin", dir))?,
             street_entries: mmap_file(&format!("{}/street_entries.bin", dir))?,
-            street_ways: mmap_file(&format!("{}/street_ways.bin", dir))?,
-            street_nodes: mmap_file(&format!("{}/street_nodes.bin", dir))?,
+            street_ways,
+            street_nodes,
             addr_entries: mmap_file(&format!("{}/addr_entries.bin", dir))?,
-            addr_points: mmap_file(&format!("{}/addr_points.bin", dir))?,
+            addr_points,
             interp_entries: mmap_file(&format!("{}/interp_entries.bin", dir))?,
-            interp_ways: mmap_file(&format!("{}/interp_ways.bin", dir))?,
-            interp_nodes: mmap_file(&format!("{}/interp_nodes.bin", dir))?,
+            interp_ways,
+            interp_nodes,
             admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
-            admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
-            admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
+            admin_polygons,
+            admin_vertices,
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
-            country_boundaries: CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180)
-                .map_err(|e| format!("Failed to load country boundaries: {}", e))?,
+            addr_point_count,
+            street_way_count,
+            street_node_count,
+            interp_way_count,
+            interp_node_count,
+            admin_polygon_count,
+            admin_vertex_count,
         })
     }
 
     fn get_string(&self, offset: u32) -> &str {
-        let bytes = &self.strings[offset as usize..];
+        let Some(bytes) = self.strings.get(offset as usize..) else { return ""; };
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         std::str::from_utf8(&bytes[..end]).unwrap_or("")
     }
@@ -232,31 +256,31 @@ impl Index {
         let all_points: &[AddrPoint] = unsafe {
             std::slice::from_raw_parts(
                 self.addr_points.as_ptr() as *const AddrPoint,
-                self.addr_points.len() / std::mem::size_of::<AddrPoint>(),
+                self.addr_point_count,
             )
         };
         let all_ways: &[WayHeader] = unsafe {
             std::slice::from_raw_parts(
                 self.street_ways.as_ptr() as *const WayHeader,
-                self.street_ways.len() / std::mem::size_of::<WayHeader>(),
+                self.street_way_count,
             )
         };
         let all_street_nodes: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.street_nodes.as_ptr() as *const NodeCoord,
-                self.street_nodes.len() / std::mem::size_of::<NodeCoord>(),
+                self.street_node_count,
             )
         };
         let all_interps: &[InterpWay] = unsafe {
             std::slice::from_raw_parts(
                 self.interp_ways.as_ptr() as *const InterpWay,
-                self.interp_ways.len() / std::mem::size_of::<InterpWay>(),
+                self.interp_way_count,
             )
         };
         let all_interp_nodes: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.interp_nodes.as_ptr() as *const NodeCoord,
-                self.interp_nodes.len() / std::mem::size_of::<NodeCoord>(),
+                self.interp_node_count,
             )
         };
 
@@ -271,14 +295,14 @@ impl Index {
         let mut best_interp_t: f64 = 0.0;
 
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
-        let mut seen_streets: [u32; 64] = [u32::MAX; 64];
+        let mut seen_streets: [u32; 256] = [u32::MAX; 256];
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        for c in std::iter::once(cell).chain(neighbors.into_iter().map(|c| c.0)) {
             let offsets = Self::lookup_geo_cell(&self.geo_cells, c);
 
             // Addresses
             Self::for_each_entry(&self.addr_entries, offsets.addr, |id| {
-                let point = &all_points[id as usize];
+                let Some(point) = all_points.get(id as usize) else { return; };
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let dist = dist_sq(dlat, dlng, cos_lat);
@@ -290,14 +314,14 @@ impl Index {
 
             // Streets
             Self::for_each_entry(&self.street_entries, offsets.street, |id| {
-                let slot = (id as usize) & 0x3F;
+                let slot = (id as usize) & 0xFF;
                 if seen_streets[slot] == id { return; }
                 seen_streets[slot] = id;
 
-                let way = &all_ways[id as usize];
+                let Some(way) = all_ways.get(id as usize) else { return; };
                 let offset = way.node_offset as usize;
                 let count = way.node_count as usize;
-                let nodes = &all_street_nodes[offset..offset + count];
+                let Some(nodes) = all_street_nodes.get(offset..offset + count) else { return; };
 
                 for i in 0..nodes.len() - 1 {
                     let dist = point_to_segment_distance(
@@ -315,12 +339,12 @@ impl Index {
 
             // Interpolation
             Self::for_each_entry(&self.interp_entries, offsets.interp, |id| {
-                let iw = &all_interps[id as usize];
+                let Some(iw) = all_interps.get(id as usize) else { return; };
                 if iw.start_number == 0 || iw.end_number == 0 { return; }
 
                 let offset = iw.node_offset as usize;
                 let count = iw.node_count as usize;
-                let nodes = &all_interp_nodes[offset..offset + count];
+                let Some(nodes) = all_interp_nodes.get(offset..offset + count) else { return; };
 
                 let mut total_len: f64 = 0.0;
                 for i in 0..nodes.len() - 1 {
@@ -394,13 +418,13 @@ impl Index {
         let all_polygons: &[AdminPolygon] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+                self.admin_polygon_count,
             )
         };
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertex_count,
             )
         };
 
@@ -410,11 +434,11 @@ impl Index {
         const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        for c in std::iter::once(cell).chain(neighbors.into_iter().map(|c| c.0)) {
             Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
                 let poly_id = (id & ID_MASK) as usize;
-                let poly = &all_polygons[poly_id];
+                let Some(poly) = all_polygons.get(poly_id) else { return; };
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
 
@@ -424,11 +448,10 @@ impl Index {
                 }
 
                 // Interior cells skip point-in-polygon test
-                if is_interior || point_in_polygon(lat as f32, lng as f32, {
-                    let offset = poly.vertex_offset as usize;
-                    let count = poly.vertex_count as usize;
-                    &all_vertices[offset..offset + count]
-                }) {
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                let Some(vertices) = all_vertices.get(offset..offset + count) else { return; };
+                if is_interior || point_in_polygon(lat as f32, lng as f32, vertices) {
                     best_by_level[level] = Some((poly.area, poly));
                 }
             });
@@ -466,24 +489,8 @@ impl Index {
     fn query(&self, lat: f64, lng: f64) -> Address<'_> {
         let max_dist = self.max_distance_sq;
 
-        let mut admin = self.find_admin(lat, lng);
+        let admin = self.find_admin(lat, lng);
         let (addr, interp, street) = self.query_geo(lat, lng);
-
-        // Fallback: use country-boundaries crate when S2 admin lookup has no country
-        if admin.country.is_none() {
-            if let Ok(latlon) = LatLon::new(lat, lng) {
-                for id in self.country_boundaries.ids(latlon) {
-                    if id.len() == 2 {
-                        let b0 = id.as_bytes()[0].to_ascii_uppercase();
-                        let b1 = id.as_bytes()[1].to_ascii_uppercase();
-                        admin.country_code = Some([b0, b1]);
-                        let upper = id.to_ascii_uppercase();
-                        admin.country = country_code_to_name(&upper);
-                        break;
-                    }
-                }
-            }
-        }
 
         // Determine house_number and road from best geo match (priority: address > interpolation > street)
         let mut house_number: Option<Cow<'_, str>> = None;
@@ -589,254 +596,6 @@ fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     inside
 }
 
-// --- Country code fallback ---
-
-fn country_code_to_name(code: &str) -> Option<&'static str> {
-    Some(match code {
-        // Europe
-        "AD" => "Andorra",
-        "AL" => "Shqipëria",
-        "AT" => "Österreich",
-        "BA" => "Bosna i Hercegovina",
-        "BE" => "België / Belgique / Belgien",
-        "BG" => "България",
-        "BY" => "Беларусь",
-        "CH" => "Schweiz/Suisse/Svizzera",
-        "CY" => "Κύπρος",
-        "CZ" => "Česko",
-        "DE" => "Deutschland",
-        "DK" => "Danmark",
-        "EE" => "Eesti",
-        "ES" => "España",
-        "FI" => "Suomi",
-        "FR" => "France",
-        "GB" => "United Kingdom",
-        "GG" => "Guernsey",
-        "GI" => "Gibraltar",
-        "GR" => "Ελλάς",
-        "HR" => "Hrvatska",
-        "HU" => "Magyarország",
-        "IE" => "Ireland",
-        "IM" => "Isle of Man",
-        "IS" => "Ísland",
-        "IT" => "Italia",
-        "JE" => "Jersey",
-        "LI" => "Liechtenstein",
-        "LT" => "Lietuva",
-        "LU" => "Luxembourg",
-        "LV" => "Latvija",
-        "MC" => "Monaco",
-        "MD" => "Moldova",
-        "ME" => "Crna Gora",
-        "MK" => "Северна Македонија",
-        "MT" => "Malta",
-        "NL" => "Nederland",
-        "NO" => "Norge",
-        "PL" => "Polska",
-        "PT" => "Portugal",
-        "RO" => "România",
-        "RS" => "Србија",
-        "RU" => "Россия",
-        "SE" => "Sverige",
-        "SI" => "Slovenija",
-        "SK" => "Slovensko",
-        "SM" => "San Marino",
-        "TR" => "Türkiye",
-        "UA" => "Україна",
-        "VA" => "Città del Vaticano",
-        "XK" => "Kosovë",
-        // Americas
-        "AG" => "Antigua and Barbuda",
-        "AI" => "Anguilla",
-        "AR" => "Argentina",
-        "AW" => "Aruba",
-        "BB" => "Barbados",
-        "BL" => "Saint-Barthélemy",
-        "BM" => "Bermuda",
-        "BO" => "Bolivia",
-        "BQ" => "Bonaire",
-        "BR" => "Brasil",
-        "BS" => "The Bahamas",
-        "BZ" => "Belize",
-        "CA" => "Canada",
-        "CL" => "Chile",
-        "CO" => "Colombia",
-        "CR" => "Costa Rica",
-        "CU" => "Cuba",
-        "CW" => "Curaçao",
-        "DM" => "Dominica",
-        "DO" => "República Dominicana",
-        "EC" => "Ecuador",
-        "FK" => "Falkland Islands",
-        "GD" => "Grenada",
-        "GF" => "Guyane française",
-        "GP" => "Guadeloupe",
-        "GT" => "Guatemala",
-        "GY" => "Guyana",
-        "HN" => "Honduras",
-        "HT" => "Haïti",
-        "JM" => "Jamaica",
-        "KN" => "Saint Kitts and Nevis",
-        "KY" => "Cayman Islands",
-        "LC" => "Saint Lucia",
-        "MF" => "Saint-Martin",
-        "MQ" => "Martinique",
-        "MS" => "Montserrat",
-        "MX" => "México",
-        "NI" => "Nicaragua",
-        "PA" => "Panamá",
-        "PE" => "Perú",
-        "PM" => "Saint-Pierre-et-Miquelon",
-        "PR" => "Puerto Rico",
-        "PY" => "Paraguay",
-        "SR" => "Suriname",
-        "SV" => "El Salvador",
-        "SX" => "Sint Maarten",
-        "TC" => "Turks and Caicos Islands",
-        "TT" => "Trinidad and Tobago",
-        "US" => "United States",
-        "UY" => "Uruguay",
-        "VC" => "Saint Vincent and the Grenadines",
-        "VE" => "Venezuela",
-        "VG" => "British Virgin Islands",
-        "VI" => "United States Virgin Islands",
-        // Africa
-        "AO" => "Angola",
-        "BF" => "Burkina Faso",
-        "BI" => "Burundi",
-        "BJ" => "Bénin",
-        "BW" => "Botswana",
-        "CD" => "République démocratique du Congo",
-        "CF" => "République centrafricaine",
-        "CG" => "République du Congo",
-        "CI" => "Côte d'Ivoire",
-        "CM" => "Cameroun",
-        "CV" => "Cabo Verde",
-        "DJ" => "Djibouti",
-        "DZ" => "الجزائر",
-        "EG" => "مصر",
-        "EH" => "الصحراء الغربية",
-        "ER" => "ኤርትራ",
-        "ET" => "ኢትዮጵያ",
-        "GA" => "Gabon",
-        "GH" => "Ghana",
-        "GM" => "The Gambia",
-        "GN" => "Guinée",
-        "GQ" => "Guinea Ecuatorial",
-        "GW" => "Guiné-Bissau",
-        "KE" => "Kenya",
-        "KM" => "Komori",
-        "LR" => "Liberia",
-        "LS" => "Lesotho",
-        "LY" => "ليبيا",
-        "MA" => "المغرب",
-        "MG" => "Madagasikara",
-        "ML" => "Mali",
-        "MR" => "موريتانيا",
-        "MU" => "Mauritius",
-        "MW" => "Malawi",
-        "MZ" => "Moçambique",
-        "NA" => "Namibia",
-        "NE" => "Niger",
-        "NG" => "Nigeria",
-        "RE" => "La Réunion",
-        "RW" => "Rwanda",
-        "SC" => "Seychelles",
-        "SD" => "السودان",
-        "SH" => "Saint Helena",
-        "SL" => "Sierra Leone",
-        "SN" => "Sénégal",
-        "SO" => "Soomaaliya",
-        "SS" => "South Sudan",
-        "ST" => "São Tomé e Príncipe",
-        "SZ" => "Eswatini",
-        "TD" => "Tchad",
-        "TG" => "Togo",
-        "TN" => "تونس",
-        "TZ" => "Tanzania",
-        "UG" => "Uganda",
-        "YT" => "Mayotte",
-        "ZA" => "South Africa",
-        "ZM" => "Zambia",
-        "ZW" => "Zimbabwe",
-        // Asia
-        "AE" => "الإمارات العربيّة المتّحدة",
-        "AF" => "افغانستان",
-        "AM" => "Հայաստան",
-        "AZ" => "Azərbaycan",
-        "BD" => "বাংলাদেশ",
-        "BH" => "البحرين",
-        "BN" => "Brunei",
-        "BT" => "འབྲུག་ཡུལ",
-        "CN" => "中国",
-        "GE" => "საქართველო",
-        "HK" => "香港",
-        "ID" => "Indonesia",
-        "IL" => "ישראל",
-        "IN" => "India",
-        "IQ" => "العراق",
-        "IR" => "ایران",
-        "JO" => "الأردن",
-        "JP" => "日本",
-        "KG" => "Кыргызстан",
-        "KH" => "កម្ពុជា",
-        "KP" => "조선민주주의인민공화국",
-        "KR" => "대한민국",
-        "KW" => "الكويت",
-        "KZ" => "Қазақстан",
-        "LA" => "ລາວ",
-        "LB" => "لبنان",
-        "LK" => "Sri Lanka",
-        "MM" => "မြန်မာ",
-        "MN" => "Монгол улс",
-        "MO" => "澳門",
-        "MV" => "Maldives",
-        "MY" => "Malaysia",
-        "NP" => "नेपाल",
-        "OM" => "عُمان",
-        "PH" => "Pilipinas",
-        "PK" => "پاکستان",
-        "PS" => "فلسطين",
-        "QA" => "قطر",
-        "SA" => "السعودية",
-        "SG" => "Singapore",
-        "SY" => "سوريا",
-        "TH" => "ประเทศไทย",
-        "TJ" => "Тоҷикистон",
-        "TL" => "Timor-Leste",
-        "TM" => "Türkmenistan",
-        "TW" => "臺灣",
-        "UZ" => "Oʻzbekiston",
-        "VN" => "Việt Nam",
-        "YE" => "اليمن",
-        // Oceania
-        "AS" => "American Samoa",
-        "AU" => "Australia",
-        "CK" => "Cook Islands",
-        "FJ" => "Fiji",
-        "FM" => "Micronesia",
-        "GU" => "Guam",
-        "KI" => "Kiribati",
-        "MH" => "Marshall Islands",
-        "MP" => "Northern Mariana Islands",
-        "NC" => "Nouvelle-Calédonie",
-        "NR" => "Nauru",
-        "NU" => "Niue",
-        "NZ" => "New Zealand / Aotearoa",
-        "PF" => "Polynésie française",
-        "PG" => "Papua New Guinea",
-        "PW" => "Palau",
-        "SB" => "Solomon Islands",
-        "TK" => "Tokelau",
-        "TO" => "Tonga",
-        "TV" => "Tuvalu",
-        "VU" => "Vanuatu",
-        "WF" => "Wallis-et-Futuna",
-        "WS" => "Samoa",
-        _ => return None,
-    })
-}
-
 // --- API types ---
 
 #[derive(Default)]
@@ -900,66 +659,71 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     }
 
     let (number_after, postcode_before_city, include_state) = format_rules(addr.country_code.as_deref());
-    let mut parts: Vec<String> = Vec::new();
+    let mut result = String::with_capacity(200);
 
     // Street + house number
     if let Some(road) = addr.road {
         if let Some(ref hn) = addr.house_number {
             if number_after {
-                parts.push(format!("{} {}", road, hn));
+                result.push_str(road);
+                result.push(' ');
+                result.push_str(hn);
             } else {
-                parts.push(format!("{} {}", hn, road));
+                result.push_str(hn);
+                result.push(' ');
+                result.push_str(road);
             }
         } else {
-            parts.push(road.to_string());
+            result.push_str(road);
         }
     }
 
-    // City + postcode + state
+    // City + postcode + state: optimistically write separator, truncate if block is empty
+    let before_city = result.len();
+    if !result.is_empty() { result.push_str(", "); }
+    let city_block_start = result.len();
+
     if postcode_before_city {
-        let mut city_part = String::new();
         if let Some(pc) = addr.postcode {
-            city_part.push_str(pc);
-            city_part.push(' ');
+            result.push_str(pc);
         }
         if let Some(city) = addr.city {
-            city_part.push_str(city);
+            if result.len() > city_block_start { result.push(' '); }
+            result.push_str(city);
         }
         if include_state {
             if let Some(state) = addr.state {
-                if !city_part.is_empty() { city_part.push_str(", "); }
-                city_part.push_str(state);
+                if result.len() > city_block_start { result.push_str(", "); }
+                result.push_str(state);
             }
-        }
-        if !city_part.is_empty() {
-            parts.push(city_part.trim().to_string());
         }
     } else {
-        let mut city_part = String::new();
         if let Some(city) = addr.city {
-            city_part.push_str(city);
+            result.push_str(city);
         }
         if include_state {
             if let Some(state) = addr.state {
-                if !city_part.is_empty() { city_part.push_str(", "); }
-                city_part.push_str(state);
+                if result.len() > city_block_start { result.push_str(", "); }
+                result.push_str(state);
             }
         }
         if let Some(pc) = addr.postcode {
-            if !city_part.is_empty() { city_part.push(' '); }
-            city_part.push_str(pc);
+            if result.len() > city_block_start { result.push(' '); }
+            result.push_str(pc);
         }
-        if !city_part.is_empty() {
-            parts.push(city_part);
-        }
+    }
+
+    if result.len() == city_block_start {
+        result.truncate(before_city);
     }
 
     // Country
     if let Some(country) = addr.country {
-        parts.push(country.to_string());
+        if !result.is_empty() { result.push_str(", "); }
+        result.push_str(country);
     }
 
-    if parts.is_empty() { None } else { Some(parts.join(", ")) }
+    if result.is_empty() { None } else { Some(result) }
 }
 
 #[derive(Deserialize)]
@@ -994,6 +758,13 @@ async fn reverse_geocode(
 
     if let Err(msg) = auth::check_rate(&limiter, &rate_key, rps, rpd) {
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    }
+
+    if !params.lat.is_finite() || !params.lon.is_finite()
+        || params.lat < -90.0 || params.lat > 90.0
+        || params.lon < -180.0 || params.lon > 180.0
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid coordinates").into_response();
     }
 
     let address = index.query(params.lat, params.lon);

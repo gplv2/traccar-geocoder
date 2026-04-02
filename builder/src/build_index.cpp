@@ -15,10 +15,14 @@
 #include <osmium/visitor.hpp>
 #include <osmium/handler/node_locations_for_ways.hpp>
 #include <fcntl.h>
+#include <iomanip>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <osmium/index/map/sparse_file_array.hpp>
+#include <osmium/index/map/sparse_mem_array.hpp>
 #include <osmium/area/assembler.hpp>
 #include <osmium/area/multipolygon_manager.hpp>
+#include <osmium/area/problem_reporter_stream.hpp>
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -27,6 +31,8 @@
 #include <s2/s2polygon.h>
 #include <s2/s2loop.h>
 #include <s2/s2builder.h>
+#include <s2/s2builderutil_s2polygon_layer.h>
+#include <s2/s2latlng_rect.h>
 
 // --- Binary format structs ---
 
@@ -120,7 +126,27 @@ static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 static int kStreetCellLevel = 17;
 static int kAdminCellLevel = 10;
 
+// Diagnostic flags and counters
+static bool verbose = false;
+static bool debug = false;
+static bool in_memory = false;
+static std::string tmp_dir;
+
+static uint64_t admin_stored = 0;
+static uint64_t admin_s2_direct = 0;
+static uint64_t admin_s2_repaired = 0;
+static uint64_t admin_bbox_fallback = 0;
+static uint64_t admin_simplified_dropped = 0;
+static uint64_t admin_too_few_points = 0;
+static uint64_t admin_invalid_nodes_skipped = 0;
+
 static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2) {
+    static S2RegionCoverer coverer([](){
+        S2RegionCoverer::Options options;
+        options.set_fixed_level(kStreetCellLevel);
+        return options;
+    }());
+
     S2Point p1 = S2LatLng::FromDegrees(lat1, lng1).ToPoint();
     S2Point p2 = S2LatLng::FromDegrees(lat2, lng2).ToPoint();
 
@@ -130,17 +156,45 @@ static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, d
 
     std::vector<S2Point> points = {p1, p2};
     S2Polyline polyline(points);
-
-    S2RegionCoverer::Options options;
-    options.set_fixed_level(kStreetCellLevel);
-
-    S2RegionCoverer coverer(options);
     S2CellUnion covering = coverer.GetCovering(polyline);
     return covering.cell_ids();
 }
 
 static S2CellId point_to_cell(double lat, double lng) {
     return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel);
+}
+
+// Fallback cell covering using the polygon's bounding box.
+// Used when both S2Loop validation and S2Builder repair fail.
+// All cells are non-interior (forces point-in-polygon test at query time).
+// Uses set_fixed_level to avoid cell explosion from expanding coarse cells.
+static std::vector<std::pair<S2CellId, bool>> cover_polygon_bbox(
+    const std::vector<std::pair<double,double>>& vertices) {
+    double min_lat = 90, max_lat = -90, min_lng = 180, max_lng = -180;
+    for (const auto& [lat, lng] : vertices) {
+        min_lat = std::min(min_lat, lat);
+        max_lat = std::max(max_lat, lat);
+        min_lng = std::min(min_lng, lng);
+        max_lng = std::max(max_lng, lng);
+    }
+    S2LatLngRect rect(
+        S2LatLng::FromDegrees(min_lat, min_lng),
+        S2LatLng::FromDegrees(max_lat, max_lng));
+
+    static S2RegionCoverer coverer([](){
+        S2RegionCoverer::Options options;
+        options.set_fixed_level(kAdminCellLevel);
+        options.set_max_cells(500);
+        return options;
+    }());
+    S2CellUnion covering = coverer.GetCovering(rect);
+
+    std::vector<std::pair<S2CellId, bool>> result;
+    result.reserve(covering.size());
+    for (const auto& cell : covering.cell_ids()) {
+        result.emplace_back(cell, false);
+    }
+    return result;
 }
 
 // Returns pairs of (cell_id, is_interior)
@@ -156,21 +210,64 @@ static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<st
     if (points.size() > 1 && points.front() == points.back()) {
         points.pop_back();
     }
-    if (points.size() < 3) return {};
+    if (points.size() < 3) {
+        admin_too_few_points++;
+        return {};
+    }
 
-    // Build S2Loop (must be CCW), skip invalid polygons
+    // Build S2Loop, attempt repair if invalid, bbox fallback as last resort
     S2Error error;
     auto loop = std::make_unique<S2Loop>(points, S2Debug::DISABLE);
     loop->Normalize();
-    if (loop->FindValidationError(&error)) return {};
 
-    S2Polygon polygon(std::move(loop));
+    S2Polygon polygon;
+    if (!loop->FindValidationError(&error)) {
+        // Fast path: valid polygon
+        polygon = S2Polygon(std::move(loop));
+        admin_s2_direct++;
+    } else {
+        // Repair path: use S2Builder to fix crossing edges
+        S2Builder::Options builder_options;
+        builder_options.set_split_crossing_edges(true);
+        S2Builder builder(builder_options);
+        S2Polygon repaired;
+        builder.StartLayer(
+            std::make_unique<s2builderutil::S2PolygonLayer>(&repaired));
+        for (size_t i = 0; i < points.size(); i++) {
+            builder.AddEdge(points[i], points[(i + 1) % points.size()]);
+        }
+        S2Error build_error;
+        if (builder.Build(&build_error) && repaired.num_loops() > 0) {
+            polygon = std::move(repaired);
+            admin_s2_repaired++;
+            if (verbose) {
+                std::cerr << "  S2Builder repaired polygon ("
+                          << points.size() << " vertices): "
+                          << error << std::endl;
+            }
+        } else {
+            // Last resort: bbox covering
+            admin_bbox_fallback++;
+            if (verbose) {
+                std::cerr << "  BBOX fallback (" << points.size()
+                          << " vertices): S2=" << error;
+                if (build_error.ok()) {
+                    std::cerr << ", builder produced 0 loops";
+                } else {
+                    std::cerr << ", builder=" << build_error;
+                }
+                std::cerr << std::endl;
+            }
+            return cover_polygon_bbox(vertices);
+        }
+    }
 
-    S2RegionCoverer::Options options;
-    options.set_max_level(kAdminCellLevel);
-    options.set_max_cells(200);
-
-    S2RegionCoverer coverer(options);
+    static S2RegionCoverer coverer([](){
+        S2RegionCoverer::Options options;
+        options.set_max_level(kAdminCellLevel);
+        options.set_max_cells(200);
+        return options;
+    }());
     S2CellUnion covering = coverer.GetCovering(polygon);
     S2CellUnion interior = coverer.GetInteriorCovering(polygon);
 
@@ -313,16 +410,13 @@ static std::vector<std::pair<double,double>> simplify_polygon(
 
 // --- Highway filter ---
 
-static const std::vector<std::string> kExcludedHighways = {
+static const std::unordered_set<std::string> kExcludedHighways = {
     "footway", "path", "track", "steps", "cycleway",
     "service", "pedestrian", "bridleway", "construction"
 };
 
 static bool is_included_highway(const char* value) {
-    for (const auto& excluded : kExcludedHighways) {
-        if (excluded == value) return false;
-    }
-    return true;
+    return kExcludedHighways.find(value) == kExcludedHighways.end();
 }
 
 // --- Parse house number (leading digits) ---
@@ -365,8 +459,16 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
                                const char* name, uint8_t admin_level,
                                const char* country_code) {
     // Simplify large polygons
-    auto simplified = simplify_polygon(vertices, 500);
-    if (simplified.size() < 3) return;
+    auto simplified = simplify_polygon(vertices, 10000);
+    if (simplified.size() < 3) {
+        admin_simplified_dropped++;
+        if (verbose) {
+            std::cerr << "  DROP: " << name << " (level " << (int)admin_level
+                      << "): simplified from " << vertices.size() << " to "
+                      << simplified.size() << " vertices" << std::endl;
+        }
+        return;
+    }
 
     uint32_t poly_id = static_cast<uint32_t>(admin_polygons.size());
     uint32_t vertex_offset = static_cast<uint32_t>(admin_vertices.size());
@@ -385,6 +487,7 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
         ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
         : 0;
     admin_polygons.push_back(poly);
+    admin_stored++;
 
     // S2 cell coverage (high bit marks interior cells)
     auto cell_ids = cover_polygon(simplified);
@@ -474,11 +577,20 @@ public:
         // Extract outer ring vertices
         for (const auto& outer_ring : area.outer_rings()) {
             std::vector<std::pair<double,double>> vertices;
+            uint32_t skipped_nodes = 0;
             for (const auto& node_ref : outer_ring) {
                 if (node_ref.location().valid()) {
                     vertices.emplace_back(node_ref.location().lat(), node_ref.location().lon());
+                } else {
+                    skipped_nodes++;
                 }
             }
+            if (verbose && skipped_nodes > 0) {
+                std::cerr << "  WARN: " << name_str << " (level " << (int)admin_level
+                          << "): skipped " << skipped_nodes << " invalid nodes in outer ring"
+                          << std::endl;
+            }
+            admin_invalid_nodes_skipped += skipped_nodes;
             if (vertices.size() >= 3) {
                 add_admin_polygon(vertices, name_str.c_str(), admin_level, country_code);
             }
@@ -829,11 +941,34 @@ static void write_index(const std::string& output_dir) {
 
 }
 
+// --- Capacity estimation from PBF file size ---
+
+struct SizeEstimate {
+    size_t ways;
+    size_t addr_points;
+    size_t street_nodes;
+    size_t admin_polygons;
+    size_t admin_vertices;
+};
+
+static SizeEstimate estimate_from_file_size(size_t total_bytes) {
+    double gb = total_bytes / (1024.0 * 1024.0 * 1024.0);
+    // Conservative per-GB ratios from Italy/France/Benelux testing
+    // with 20% headroom to avoid reallocations
+    return {
+        static_cast<size_t>(gb * 900000),    // ways (~870K/GB observed)
+        static_cast<size_t>(gb * 7500000),   // addr_points (highly variable, use high estimate)
+        static_cast<size_t>(gb * 4500000),   // street_nodes (~3-5 nodes per way)
+        static_cast<size_t>(gb * 15000),     // admin_polygons
+        static_cast<size_t>(gb * 500000),    // admin_vertices
+    };
+}
+
 // --- Main ---
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N]" << std::endl;
+        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--verbose] [--debug] [--in-memory] [--tmpdir DIR]" << std::endl;
         return 1;
     }
 
@@ -845,8 +980,39 @@ int main(int argc, char* argv[]) {
             kStreetCellLevel = std::atoi(argv[++i]);
         } else if (arg == "--admin-level" && i + 1 < argc) {
             kAdminCellLevel = std::atoi(argv[++i]);
+        } else if (arg == "--verbose") {
+            verbose = true;
+        } else if (arg == "--debug") {
+            debug = true;
+            verbose = true;
+        } else if (arg == "--in-memory") {
+            in_memory = true;
+        } else if (arg == "--tmpdir" && i + 1 < argc) {
+            tmp_dir = argv[++i];
         } else {
             input_files.push_back(arg);
+        }
+    }
+
+    // Pre-allocate vectors based on total PBF file size
+    size_t total_pbf_bytes = 0;
+    for (const auto& input_file : input_files) {
+        struct stat st;
+        if (stat(input_file.c_str(), &st) == 0) {
+            total_pbf_bytes += st.st_size;
+        }
+    }
+    if (total_pbf_bytes > 0) {
+        auto est = estimate_from_file_size(total_pbf_bytes);
+        ways.reserve(est.ways);
+        addr_points.reserve(est.addr_points);
+        street_nodes.reserve(est.street_nodes);
+        admin_polygons.reserve(est.admin_polygons);
+        admin_vertices.reserve(est.admin_vertices);
+        if (verbose) {
+            double gb = total_pbf_bytes / (1024.0 * 1024.0 * 1024.0);
+            std::cerr << "Pre-allocated for " << std::fixed << std::setprecision(1)
+                      << gb << " GB of PBF data" << std::endl;
         }
     }
 
@@ -859,10 +1025,15 @@ int main(int argc, char* argv[]) {
         std::cerr << "  Pass 1: scanning relations..." << std::endl;
 
         osmium::area::Assembler::config_type assembler_config;
+        assembler_config.ignore_invalid_locations = true;
+        osmium::area::ProblemReporterStream problem_reporter{std::cerr};
+        if (debug) {
+            assembler_config.problem_reporter = &problem_reporter;
+        }
         osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
 
         {
-            osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
+            osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation, osmium::io::read_meta::no};
             osmium::apply(reader1, mp_manager);
             reader1.close();
             mp_manager.prepare_for_lookup();
@@ -871,23 +1042,39 @@ int main(int argc, char* argv[]) {
         // --- Pass 2: process all data ---
         std::cerr << "  Pass 2: processing nodes, ways, and areas..." << std::endl;
 
-        using index_type = osmium::index::map::SparseFileArray<
-            osmium::unsigned_object_id_type, osmium::Location>;
-        using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
+        if (in_memory) {
+            using index_type = osmium::index::map::SparseMemArray<
+                osmium::unsigned_object_id_type, osmium::Location>;
+            using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
-        std::string tmp_path = output_dir + "/node_locations.tmp";
-        int fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-        index_type index{fd};
-        location_handler_type location_handler{index};
+            index_type index;
+            location_handler_type location_handler{index};
+            location_handler.ignore_errors();
 
-        osmium::io::Reader reader2{input_file};
+            osmium::io::Reader reader2{input_file, osmium::io::read_meta::no};
+            osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
+                osmium::apply(buffer, handler);
+            }));
+            reader2.close();
+        } else {
+            using index_type = osmium::index::map::SparseFileArray<
+                osmium::unsigned_object_id_type, osmium::Location>;
+            using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
-        osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
-            osmium::apply(buffer, handler);
-        }));
-        reader2.close();
-        close(fd);
-        std::remove(tmp_path.c_str());
+            std::string tmp_path = (tmp_dir.empty() ? output_dir : tmp_dir) + "/node_locations.tmp";
+            int fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+            index_type index{fd};
+            location_handler_type location_handler{index};
+            location_handler.ignore_errors();
+
+            osmium::io::Reader reader2{input_file, osmium::io::read_meta::no};
+            osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
+                osmium::apply(buffer, handler);
+            }));
+            reader2.close();
+            close(fd);
+            std::remove(tmp_path.c_str());
+        }
     }
 
     std::cerr << "Done reading:" << std::endl;
@@ -897,6 +1084,17 @@ int main(int argc, char* argv[]) {
     std::cerr << "  " << handler.interp_count() << " interpolation ways" << std::endl;
     std::cerr << "  " << handler.admin_count() << " admin/postcode boundaries ("
               << admin_polygons.size() << " polygon rings)" << std::endl;
+
+    std::cerr << "Admin polygon pipeline:" << std::endl;
+    std::cerr << "  " << admin_stored << " polygon rings stored" << std::endl;
+    std::cerr << "  " << admin_s2_direct << " S2 valid (direct)" << std::endl;
+    std::cerr << "  " << admin_s2_repaired << " S2 repaired (S2Builder)" << std::endl;
+    std::cerr << "  " << admin_bbox_fallback << " bbox fallback (S2 + S2Builder both failed)" << std::endl;
+    std::cerr << "  " << admin_simplified_dropped << " dropped by simplification (<3 vertices)" << std::endl;
+    std::cerr << "  " << admin_too_few_points << " dropped by cover_polygon (<3 unique S2 points)" << std::endl;
+    if (admin_invalid_nodes_skipped > 0) {
+        std::cerr << "  " << admin_invalid_nodes_skipped << " total invalid nodes skipped in boundaries" << std::endl;
+    }
 
     std::cerr << "Resolving interpolation endpoints..." << std::endl;
     resolve_interpolation_endpoints();
