@@ -449,7 +449,7 @@ Whether a country is affected depends on how its admin_level=2 boundary relation
 |---|---|---|
 | France | Single admin_level=2 relation (r2202162) includes all overseas departments as outer ways | Reunion, Guadeloupe, Martinique, French Guiana, Mayotte |
 | Netherlands | Single relation includes Caribbean territories | Aruba, Curacao, Sint Maarten, Caribbean Netherlands |
-| Spain | Relation includes Canary Islands (needs verification) | Canary Islands, Ceuta, Melilla |
+| Spain | Main admin_level=2 relation includes Canary Islands (off Africa) and Ceuta/Melilla (North Africa). Mainland and Barcelona return no country. Balearic Islands (Mallorca) return "Espana (mar territorial)" from a separate maritime boundary relation that is complete within the extract. | Canary Islands, Ceuta, Melilla |
 
 **Verified NOT affected** (country data present on Europe extract):
 
