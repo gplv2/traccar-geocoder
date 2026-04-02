@@ -441,17 +441,25 @@ Building from the Europe PBF with `--verbose` confirmed: zero invalid nodes were
 
 ### Countries affected
 
-Any country whose admin_level=2 boundary relation includes ways outside the continent extract:
+Whether a country is affected depends on how its admin_level=2 boundary relation is structured in OSM and whether its overseas territories fall inside or outside Geofabrik's Europe extract bounding box.
 
-| Country | Overseas territory | In Europe extract? |
+**Verified affected** (missing country on Europe extract, confirmed on production):
+
+| Country | Why | Overseas territory outside extract |
 |---|---|---|
-| France | Reunion, Guadeloupe, Martinique, French Guiana, Mayotte, Saint-Pierre-et-Miquelon | No |
-| Spain | Canary Islands, Ceuta, Melilla | Partially (Canaries are borderline) |
-| Netherlands | Aruba, Curacao, Sint Maarten, Caribbean Netherlands | No |
-| Denmark | Greenland, Faroe Islands | No (Faroe borderline) |
-| Portugal | Azores, Madeira | Borderline |
+| France | Single admin_level=2 relation (r2202162) includes all overseas departments as outer ways | Reunion, Guadeloupe, Martinique, French Guiana, Mayotte |
+| Netherlands | Single relation includes Caribbean territories | Aruba, Curacao, Sint Maarten, Caribbean Netherlands |
+| Spain | Relation includes Canary Islands (needs verification) | Canary Islands, Ceuta, Melilla |
 
-Countries whose territory is fully within the continent extract (Belgium, Germany, Italy, Austria, Switzerland, etc.) are unaffected.
+**Verified NOT affected** (country data present on Europe extract):
+
+| Country | Why |
+|---|---|
+| Portugal | Azores and Madeira are within Europe's bounding box; separate maritime boundary relation exists |
+| Denmark | Mainland Denmark has its own relation; Faroe Islands has independent country code (FO); only Greenland (outside Europe) returns empty |
+| Belgium, Germany, Italy, Austria, Switzerland, etc. | Territory fully within Europe extract |
+
+The key factor is whether the country's admin_level=2 relation in OSM references ways that are geographically outside the extract boundary. Portugal and Denmark avoid the issue because their overseas territories either fall within Europe's bounding box (Azores, Madeira, Faroes) or have separate administrative relations (Greenland is its own entity, not part of Denmark's boundary polygon).
 
 ### Solution: server-side country boundary fallback
 
