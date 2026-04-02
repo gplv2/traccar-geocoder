@@ -120,7 +120,12 @@ fn mmap_file(path: &str) -> Result<Mmap, String> {
 }
 
 impl Index {
-    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
+    fn load(
+        dir: &str,
+        street_cell_level: u64,
+        admin_cell_level: u64,
+        search_distance: f64,
+    ) -> Result<Self, String> {
         let meters_to_rad = search_distance / 111_320.0;
         let max_distance_sq = meters_to_rad * meters_to_rad;
         let addr_points = mmap_file(&format!("{}/addr_points.bin", dir))?;
@@ -166,7 +171,9 @@ impl Index {
     }
 
     fn get_string(&self, offset: u32) -> &str {
-        let Some(bytes) = self.strings.get(offset as usize..) else { return ""; };
+        let Some(bytes) = self.strings.get(offset as usize..) else {
+            return "";
+        };
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         std::str::from_utf8(&bytes[..end]).unwrap_or("")
     }
@@ -185,13 +192,19 @@ impl Index {
 
     // Iterate entry IDs inline from entries file at given offset
     fn for_each_entry(entries: &[u8], offset: u32, mut f: impl FnMut(u32)) {
-        if offset == NO_DATA { return; }
+        if offset == NO_DATA {
+            return;
+        }
         let offset = offset as usize;
-        if offset + 2 > entries.len() { return; }
+        if offset + 2 > entries.len() {
+            return;
+        }
 
         let id_count = Self::read_u16(entries, offset) as usize;
         let data_start = offset + 2;
-        if data_start + id_count * 4 > entries.len() { return; }
+        if data_start + id_count * 4 > entries.len() {
+            return;
+        }
 
         for i in 0..id_count {
             f(Self::read_u32(entries, data_start + i * 4));
@@ -202,8 +215,14 @@ impl Index {
     fn lookup_geo_cell(cells: &[u8], cell_id: u64) -> GeoCellOffsets {
         let entry_size: usize = 20;
         let count = cells.len() / entry_size;
-        let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
-        if count == 0 { return empty; }
+        let empty = GeoCellOffsets {
+            street: NO_DATA,
+            addr: NO_DATA,
+            interp: NO_DATA,
+        };
+        if count == 0 {
+            return empty;
+        }
 
         let mut lo = 0usize;
         let mut hi = count;
@@ -229,7 +248,9 @@ impl Index {
     fn lookup_admin_cell(cells: &[u8], cell_id: u64) -> u32 {
         let entry_size: usize = 12;
         let count = cells.len() / entry_size;
-        if count == 0 { return NO_DATA; }
+        if count == 0 {
+            return NO_DATA;
+        }
 
         let mut lo = 0usize;
         let mut hi = count;
@@ -249,7 +270,16 @@ impl Index {
 
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
-    fn query_geo(&self, lat: f64, lng: f64) -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader)>) {
+    #[allow(clippy::type_complexity)]
+    fn query_geo(
+        &self,
+        lat: f64,
+        lng: f64,
+    ) -> (
+        Option<(f64, &AddrPoint)>,
+        Option<(f64, &str, u32)>,
+        Option<(f64, &WayHeader)>,
+    ) {
         let cell = cell_id_at_level(lat, lng, self.street_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
 
@@ -302,7 +332,9 @@ impl Index {
 
             // Addresses
             Self::for_each_entry(&self.addr_entries, offsets.addr, |id| {
-                let Some(point) = all_points.get(id as usize) else { return; };
+                let Some(point) = all_points.get(id as usize) else {
+                    return;
+                };
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let dist = dist_sq(dlat, dlng, cos_lat);
@@ -315,19 +347,28 @@ impl Index {
             // Streets
             Self::for_each_entry(&self.street_entries, offsets.street, |id| {
                 let slot = (id as usize) & 0xFF;
-                if seen_streets[slot] == id { return; }
+                if seen_streets[slot] == id {
+                    return;
+                }
                 seen_streets[slot] = id;
 
-                let Some(way) = all_ways.get(id as usize) else { return; };
+                let Some(way) = all_ways.get(id as usize) else {
+                    return;
+                };
                 let offset = way.node_offset as usize;
                 let count = way.node_count as usize;
-                let Some(nodes) = all_street_nodes.get(offset..offset + count) else { return; };
+                let Some(nodes) = all_street_nodes.get(offset..offset + count) else {
+                    return;
+                };
 
                 for i in 0..nodes.len() - 1 {
                     let dist = point_to_segment_distance(
-                        lat, lng,
-                        nodes[i].lat as f64, nodes[i].lng as f64,
-                        nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
+                        lat,
+                        lng,
+                        nodes[i].lat as f64,
+                        nodes[i].lng as f64,
+                        nodes[i + 1].lat as f64,
+                        nodes[i + 1].lng as f64,
                         cos_lat,
                     );
                     if dist < best_street_dist {
@@ -339,12 +380,18 @@ impl Index {
 
             // Interpolation
             Self::for_each_entry(&self.interp_entries, offsets.interp, |id| {
-                let Some(iw) = all_interps.get(id as usize) else { return; };
-                if iw.start_number == 0 || iw.end_number == 0 { return; }
+                let Some(iw) = all_interps.get(id as usize) else {
+                    return;
+                };
+                if iw.start_number == 0 || iw.end_number == 0 {
+                    return;
+                }
 
                 let offset = iw.node_offset as usize;
                 let count = iw.node_count as usize;
-                let Some(nodes) = all_interp_nodes.get(offset..offset + count) else { return; };
+                let Some(nodes) = all_interp_nodes.get(offset..offset + count) else {
+                    return;
+                };
 
                 let mut total_len: f64 = 0.0;
                 for i in 0..nodes.len() - 1 {
@@ -352,7 +399,9 @@ impl Index {
                     let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
                     total_len += dist_sq(dlat, dlng, cos_lat);
                 }
-                if total_len == 0.0 { return; }
+                if total_len == 0.0 {
+                    return;
+                }
 
                 let mut best_seg_dist = f64::MAX;
                 let mut best_seg_t: f64 = 0.0;
@@ -363,9 +412,12 @@ impl Index {
                     let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
                     let seg_len = dist_sq(dlat, dlng, cos_lat);
                     let (dist, seg_t) = point_to_segment_with_t(
-                        lat, lng,
-                        nodes[i].lat as f64, nodes[i].lng as f64,
-                        nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
+                        lat,
+                        lng,
+                        nodes[i].lat as f64,
+                        nodes[i].lng as f64,
+                        nodes[i + 1].lat as f64,
+                        nodes[i + 1].lng as f64,
                         cos_lat,
                     );
                     if dist < best_seg_dist {
@@ -435,49 +487,59 @@ impl Index {
         const ID_MASK: u32 = 0x7FFFFFFF;
 
         for c in std::iter::once(cell).chain(neighbors.into_iter().map(|c| c.0)) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
-                let is_interior = (id & INTERIOR_FLAG) != 0;
-                let poly_id = (id & ID_MASK) as usize;
-                let Some(poly) = all_polygons.get(poly_id) else { return; };
-                let level = poly.admin_level as usize;
-                if level >= 12 { return; }
+            Self::for_each_entry(
+                &self.admin_entries,
+                Self::lookup_admin_cell(&self.admin_cells, c),
+                |id| {
+                    let is_interior = (id & INTERIOR_FLAG) != 0;
+                    let poly_id = (id & ID_MASK) as usize;
+                    let Some(poly) = all_polygons.get(poly_id) else {
+                        return;
+                    };
+                    let level = poly.admin_level as usize;
+                    if level >= 12 {
+                        return;
+                    }
 
-                // Skip if we already have a smaller polygon at this level
-                if let Some((best_area, _)) = best_by_level[level] {
-                    if poly.area >= best_area { return; }
-                }
+                    // Skip if we already have a smaller polygon at this level
+                    if let Some((best_area, _)) = best_by_level[level] {
+                        if poly.area >= best_area {
+                            return;
+                        }
+                    }
 
-                // Interior cells skip point-in-polygon test
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                let Some(vertices) = all_vertices.get(offset..offset + count) else { return; };
-                if is_interior || point_in_polygon(lat as f32, lng as f32, vertices) {
-                    best_by_level[level] = Some((poly.area, poly));
-                }
-            });
+                    // Interior cells skip point-in-polygon test
+                    let offset = poly.vertex_offset as usize;
+                    let count = poly.vertex_count as usize;
+                    let Some(vertices) = all_vertices.get(offset..offset + count) else {
+                        return;
+                    };
+                    if is_interior || point_in_polygon(lat as f32, lng as f32, vertices) {
+                        best_by_level[level] = Some((poly.area, poly));
+                    }
+                },
+            );
         }
 
         let mut result = AdminResult::default();
 
-        for level in 0..12 {
-            if let Some((_, poly)) = best_by_level[level] {
-                let name = self.get_string(poly.name_id);
-                match poly.admin_level {
-                    2 => {
-                        result.country = Some(name);
-                        if poly.country_code != 0 {
-                            result.country_code = Some([
-                                (poly.country_code >> 8) as u8,
-                                (poly.country_code & 0xFF) as u8,
-                            ]);
-                        }
+        for (_, poly) in best_by_level.iter().flatten() {
+            let name = self.get_string(poly.name_id);
+            match poly.admin_level {
+                2 => {
+                    result.country = Some(name);
+                    if poly.country_code != 0 {
+                        result.country_code = Some([
+                            (poly.country_code >> 8) as u8,
+                            (poly.country_code & 0xFF) as u8,
+                        ]);
                     }
-                    4 => result.state = Some(name),
-                    6 => result.county = Some(name),
-                    8 => result.city = Some(name),
-                    11 => result.postcode = Some(name),
-                    _ => {}
                 }
+                4 => result.state = Some(name),
+                6 => result.county = Some(name),
+                8 => result.city = Some(name),
+                11 => result.postcode = Some(name),
+                _ => {}
             }
         }
 
@@ -530,10 +592,15 @@ impl Index {
             county: admin.county,
             postcode: admin.postcode,
             country: admin.country,
-            country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
+            country_code: admin
+                .country_code
+                .map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
         let display_name = format_address(&address);
-        Address { display_name, address }
+        Address {
+            display_name,
+            address,
+        }
     }
 }
 
@@ -544,9 +611,12 @@ fn dist_sq(dlat: f64, dlng: f64, cos_lat: f64) -> f64 {
 }
 
 fn point_to_segment_with_t(
-    px: f64, py: f64,
-    ax: f64, ay: f64,
-    bx: f64, by: f64,
+    px: f64,
+    py: f64,
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64,
     cos_lat: f64,
 ) -> (f64, f64) {
     let dx = bx - ax;
@@ -567,9 +637,12 @@ fn point_to_segment_with_t(
 }
 
 fn point_to_segment_distance(
-    px: f64, py: f64,
-    ax: f64, ay: f64,
-    bx: f64, by: f64,
+    px: f64,
+    py: f64,
+    ax: f64,
+    ay: f64,
+    bx: f64,
+    by: f64,
     cos_lat: f64,
 ) -> f64 {
     point_to_segment_with_t(px, py, ax, ay, bx, by, cos_lat).0
@@ -640,9 +713,8 @@ struct Address<'a> {
 fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
     match country_code {
         // Number before street, postcode after city, include state
-        Some("US") | Some("CA") | Some("AU") | Some("NZ")
-        | Some("GB") | Some("IE") | Some("ZA") | Some("IN")
-        | Some("NG") | Some("KE") | Some("GH") | Some("PK")
+        Some("US") | Some("CA") | Some("AU") | Some("NZ") | Some("GB") | Some("IE")
+        | Some("ZA") | Some("IN") | Some("NG") | Some("KE") | Some("GH") | Some("PK")
         | Some("PH") | Some("TH") | Some("MY") => (false, false, true),
 
         // Number before street, postcode before city, include state
@@ -658,7 +730,8 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
         return None;
     }
 
-    let (number_after, postcode_before_city, include_state) = format_rules(addr.country_code.as_deref());
+    let (number_after, postcode_before_city, include_state) =
+        format_rules(addr.country_code.as_deref());
     let mut result = String::with_capacity(200);
 
     // Street + house number
@@ -680,7 +753,9 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 
     // City + postcode + state: optimistically write separator, truncate if block is empty
     let before_city = result.len();
-    if !result.is_empty() { result.push_str(", "); }
+    if !result.is_empty() {
+        result.push_str(", ");
+    }
     let city_block_start = result.len();
 
     if postcode_before_city {
@@ -688,12 +763,16 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
             result.push_str(pc);
         }
         if let Some(city) = addr.city {
-            if result.len() > city_block_start { result.push(' '); }
+            if result.len() > city_block_start {
+                result.push(' ');
+            }
             result.push_str(city);
         }
         if include_state {
             if let Some(state) = addr.state {
-                if result.len() > city_block_start { result.push_str(", "); }
+                if result.len() > city_block_start {
+                    result.push_str(", ");
+                }
                 result.push_str(state);
             }
         }
@@ -703,12 +782,16 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
         }
         if include_state {
             if let Some(state) = addr.state {
-                if result.len() > city_block_start { result.push_str(", "); }
+                if result.len() > city_block_start {
+                    result.push_str(", ");
+                }
                 result.push_str(state);
             }
         }
         if let Some(pc) = addr.postcode {
-            if result.len() > city_block_start { result.push(' '); }
+            if result.len() > city_block_start {
+                result.push(' ');
+            }
             result.push_str(pc);
         }
     }
@@ -719,11 +802,17 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 
     // Country
     if let Some(country) = addr.country {
-        if !result.is_empty() { result.push_str(", "); }
+        if !result.is_empty() {
+            result.push_str(", ");
+        }
         result.push_str(country);
     }
 
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 #[derive(Deserialize)]
@@ -760,16 +849,23 @@ async fn reverse_geocode(
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
 
-    if !params.lat.is_finite() || !params.lon.is_finite()
-        || params.lat < -90.0 || params.lat > 90.0
-        || params.lon < -180.0 || params.lon > 180.0
+    if !params.lat.is_finite()
+        || !params.lon.is_finite()
+        || params.lat < -90.0
+        || params.lat > 90.0
+        || params.lon < -180.0
+        || params.lon > 180.0
     {
         return (StatusCode::BAD_REQUEST, "Invalid coordinates").into_response();
     }
 
     let address = index.query(params.lat, params.lon);
     let json = serde_json::to_string(&address).unwrap_or_default();
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json,
+    )
+        .into_response()
 }
 
 #[tokio::main]
@@ -778,17 +874,30 @@ async fn main() {
     let data_dir = args.get(1).map(|s| s.as_str()).unwrap_or(".");
 
     let arg_value = |flag: &str| -> Option<&String> {
-        args.iter().position(|a| a == flag).and_then(|p| args.get(p + 1))
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|p| args.get(p + 1))
     };
-    let street_cell_level = arg_value("--street-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_STREET_CELL_LEVEL);
-    let admin_cell_level = arg_value("--admin-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_ADMIN_CELL_LEVEL);
-    let search_distance = arg_value("--search-distance").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SEARCH_DISTANCE);
+    let street_cell_level = arg_value("--street-level")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_STREET_CELL_LEVEL);
+    let admin_cell_level = arg_value("--admin-level")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ADMIN_CELL_LEVEL);
+    let search_distance = arg_value("--search-distance")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SEARCH_DISTANCE);
 
     let db_path = format!("{}/geocoder.json", data_dir);
     let db = auth::Db::load(&db_path);
 
     eprintln!("Loading index from {}...", data_dir);
-    let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
+    let index = match Index::load(
+        data_dir,
+        street_cell_level,
+        admin_cell_level,
+        search_distance,
+    ) {
         Ok(idx) => Arc::new(idx),
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -809,8 +918,13 @@ async fn main() {
     // ACME mode: --domain <domain> [--cache <dir>]
     let domain_pos = args.iter().position(|a| a == "--domain");
     if let Some(pos) = domain_pos {
-        let domain = args.get(pos + 1).expect("--domain requires a value").clone();
-        let cache_dir = args.iter().position(|a| a == "--cache")
+        let domain = args
+            .get(pos + 1)
+            .expect("--domain requires a value")
+            .clone();
+        let cache_dir = args
+            .iter()
+            .position(|a| a == "--cache")
             .and_then(|p| args.get(p + 1).cloned())
             .unwrap_or_else(|| "acme-cache".to_string());
 
@@ -845,6 +959,11 @@ async fn main() {
         let bind_addr = args.get(2).map(|s| s.as_str()).unwrap_or("0.0.0.0:3000");
         eprintln!("Starting HTTP server on {}...", bind_addr);
         let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     }
 }
