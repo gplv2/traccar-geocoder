@@ -321,3 +321,55 @@ These benchmarks were run on an optimal I/O setup. On constrained environments t
 - Fast machine, lots of RAM: use `--in-memory` to skip temp file entirely
 - Cloud VM, local NVMe available: use `--tmpdir /local/nvme` to avoid block storage for temp
 - Slow machine, limited RAM: still benefits from `read_meta::no`, coverer reuse, pre-allocation, and highway filter improvements
+
+---
+
+## Europe PBF Build (32 GB)
+
+Full Europe build on the dev server using all optimizations.
+
+### Configuration
+
+| Setting | Value |
+|---|---|
+| PBF | europe-latest.osm.pbf (32 GB) |
+| Read from | ZFS array (`/data/pbf/`) |
+| Write to | NVMe (`/tmp/europe-index/`) |
+| Node index | In-memory (`--in-memory`) |
+| Flags | `--verbose --in-memory` |
+| Peak RAM usage | ~74 GB |
+
+### Results
+
+| Metric | Value |
+|---|---|
+| **Build time** | **3h 1m 17s** |
+| Street ways | 19,480,065 |
+| Address points | 86,056,695 (46,023,921 from buildings) |
+| Interpolation ways | 13,978 (4,177 resolved) |
+| Admin/postcode boundaries | 384,463 (450,597 polygon rings) |
+| S2 valid (direct) | 450,491 |
+| **S2 repaired (S2Builder)** | **106** |
+| Bbox fallback | 0 |
+| Dropped | 0 |
+| Geo cell index | 86,934,574 cells |
+| Admin cell index | 141,161 cells |
+| Strings | 82 MB |
+| **Total index size** | **6.9 GB** |
+
+### Pipeline analysis
+
+- **106 admin polygons repaired** by S2Builder across all of Europe. These would have been silently dropped by the upstream builder, causing missing state/region data for queries in those areas.
+- **Zero polygons lost.** Every boundary ring that entered the pipeline was stored with cell coverage.
+- **Zero bbox fallbacks.** S2Builder successfully repaired all invalid polygons; the bounding-box last-resort path was never needed.
+
+### Comparison with previous Europe builds
+
+| Environment | Builder | Node index | Time | Improvement |
+|---|---|---|---|---|
+| 32 GB Linode, block storage | Upstream (500 limit, no repair) | File-backed (56 GB temp) | **28+ hours** | baseline |
+| 94 GB dev server, NVMe+ZFS | New builder (10K, repair, all opts) | In-memory | **3h 1m** | **~9x faster** |
+
+The 9x speedup comes primarily from eliminating random I/O on the node location temp file. On the Linode, the 56 GB temp file far exceeded RAM, turning every node location lookup into a random read on block storage. With `--in-memory`, all lookups are RAM-resident.
+
+**Note:** The two environments differ in CPU, RAM, and storage, so this is not an apples-to-apples comparison of the code changes alone. The `--in-memory` flag is the dominant factor -- it eliminates the I/O bottleneck that caused the 28-hour build time. On the same Linode hardware, the file-backed path with the other optimizations (read_meta::no, coverer reuse, pre-allocation) would still be I/O-bound but somewhat faster than the upstream builder.
