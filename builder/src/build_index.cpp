@@ -130,6 +130,7 @@ static int kAdminCellLevel = 10;
 static bool verbose = false;
 static bool debug = false;
 static bool in_memory = false;
+static std::string tmp_dir;
 
 static uint64_t admin_stored = 0;
 static uint64_t admin_s2_direct = 0;
@@ -967,7 +968,7 @@ static SizeEstimate estimate_from_file_size(size_t total_bytes) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--verbose] [--debug] [--in-memory]" << std::endl;
+        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--verbose] [--debug] [--in-memory] [--tmpdir DIR]" << std::endl;
         return 1;
     }
 
@@ -986,6 +987,8 @@ int main(int argc, char* argv[]) {
             verbose = true;
         } else if (arg == "--in-memory") {
             in_memory = true;
+        } else if (arg == "--tmpdir" && i + 1 < argc) {
+            tmp_dir = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -1058,7 +1061,7 @@ int main(int argc, char* argv[]) {
                 osmium::unsigned_object_id_type, osmium::Location>;
             using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
-            std::string tmp_path = output_dir + "/node_locations.tmp";
+            std::string tmp_path = (tmp_dir.empty() ? output_dir : tmp_dir) + "/node_locations.tmp";
             int fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
             index_type index{fd};
             location_handler_type location_handler{index};
