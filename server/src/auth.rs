@@ -74,26 +74,47 @@ impl Db {
         fs::write(&self.path, data).expect("Failed to save database");
     }
 
-    fn create_user(&mut self, login: &str, password: &str, admin: bool, rate_per_second: u32, rate_per_day: u32, rate_by_ip: bool) {
+    fn create_user(
+        &mut self,
+        login: &str,
+        password: &str,
+        admin: bool,
+        rate_per_second: u32,
+        rate_per_day: u32,
+        rate_by_ip: bool,
+    ) {
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hash failed");
-        self.users.insert(login.to_string(), User {
-            password_hash: hash,
-            admin,
-            rate_per_second,
-            rate_per_day,
-            rate_by_ip,
-        });
+        self.users.insert(
+            login.to_string(),
+            User {
+                password_hash: hash,
+                admin,
+                rate_per_second,
+                rate_per_day,
+                rate_by_ip,
+            },
+        );
         self.save();
     }
 
     pub fn validate_token(&self, key: &str) -> Option<(String, u32, u32, bool)> {
         let login = self.tokens.get(key)?;
         let user = self.users.get(login)?;
-        Some((login.clone(), user.rate_per_second, user.rate_per_day, user.rate_by_ip))
+        Some((
+            login.clone(),
+            user.rate_per_second,
+            user.rate_per_day,
+            user.rate_by_ip,
+        ))
     }
 }
 
-pub fn check_rate(limiter: &RateLimiter, login: &str, rate_per_second: u32, rate_per_day: u32) -> Result<(), &'static str> {
+pub fn check_rate(
+    limiter: &RateLimiter,
+    login: &str,
+    rate_per_second: u32,
+    rate_per_day: u32,
+) -> Result<(), &'static str> {
     let state = {
         let map = limiter.read().unwrap();
         if let Some(s) = map.get(login) {
@@ -158,7 +179,10 @@ fn set_session_cookie(value: &str) -> ([(axum::http::header::HeaderName, String)
 }
 
 fn clear_session_cookie() -> ([(axum::http::header::HeaderName, String); 1],) {
-    ([(SET_COOKIE, "session=; Path=/; HttpOnly; Max-Age=0".to_string())],)
+    ([(
+        SET_COOKIE,
+        "session=; Path=/; HttpOnly; Max-Age=0".to_string(),
+    )],)
 }
 
 // --- Router ---
@@ -208,8 +232,11 @@ async fn login_submit(state: State<Arc<RwLock<Db>>>, Form(form): Form<LoginForm>
             return (cookie, Redirect::to("/")).into_response();
         }
     }
-    Html(LOGIN_HTML.replace("</form>", "<small><ins>Invalid credentials</ins></small></form>"))
-        .into_response()
+    Html(LOGIN_HTML.replace(
+        "</form>",
+        "<small><ins>Invalid credentials</ins></small></form>",
+    ))
+    .into_response()
 }
 
 async fn logout(headers: HeaderMap, state: State<Arc<RwLock<Db>>>) -> Response {
@@ -255,25 +282,43 @@ async fn dashboard(
         for (ulogin, user) in &db.users {
             let role = if user.admin { "Admin" } else { "User" };
             let delete = if ulogin != &login {
-                format!("<a href=\"/users/{}/delete\">Delete</a>", html_escape(ulogin))
+                format!(
+                    "<a href=\"/users/{}/delete\">Delete</a>",
+                    html_escape(ulogin)
+                )
             } else {
                 String::new()
             };
             let by_ip = if user.rate_by_ip { "Yes" } else { "" };
             user_rows.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                html_escape(ulogin), role, user.rate_per_second, user.rate_per_day, by_ip, delete
+                html_escape(ulogin),
+                role,
+                user.rate_per_second,
+                user.rate_per_day,
+                by_ip,
+                delete
             ));
         }
     }
 
-    let now_day = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 86400) as u32;
+    let now_day = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 86400) as u32;
     let daily_usage = {
         let map = limiter.read().unwrap();
-        map.get(&login).map(|s| {
-            let rate = s.inner.lock().unwrap();
-            if rate.day_ts == now_day { rate.day_count } else { 0 }
-        }).unwrap_or(0)
+        map.get(&login)
+            .map(|s| {
+                let rate = s.inner.lock().unwrap();
+                if rate.day_ts == now_day {
+                    rate.day_count
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0)
     };
 
     let html = DASHBOARD_HTML
@@ -281,7 +326,10 @@ async fn dashboard(
         .replace("{rows}", &rows)
         .replace("{user_rows}", &user_rows)
         .replace("{daily_usage}", &daily_usage.to_string())
-        .replace("{users_display}", if is_admin { "" } else { "display:none" });
+        .replace(
+            "{users_display}",
+            if is_admin { "" } else { "display:none" },
+        );
     Html(html).into_response()
 }
 
@@ -330,7 +378,11 @@ struct CreateUserForm {
     rate_by_ip: Option<String>,
 }
 
-async fn create_user_handler(headers: HeaderMap, state: State<Arc<RwLock<Db>>>, Form(form): Form<CreateUserForm>) -> Response {
+async fn create_user_handler(
+    headers: HeaderMap,
+    state: State<Arc<RwLock<Db>>>,
+    Form(form): Form<CreateUserForm>,
+) -> Response {
     let session_id = match get_session_cookie(&headers) {
         Some(s) => s,
         None => return Redirect::to("/login").into_response(),
@@ -340,7 +392,14 @@ async fn create_user_handler(headers: HeaderMap, state: State<Arc<RwLock<Db>>>, 
     if let Some(login) = db.sessions.get(&session_id).cloned() {
         let is_admin = db.users.get(&login).map(|u| u.admin).unwrap_or(false);
         if is_admin && !form.login.is_empty() && !form.password.is_empty() {
-            db.create_user(&form.login, &form.password, false, form.rate_per_second, form.rate_per_day, form.rate_by_ip.as_deref() == Some("on"));
+            db.create_user(
+                &form.login,
+                &form.password,
+                false,
+                form.rate_per_second,
+                form.rate_per_day,
+                form.rate_by_ip.as_deref() == Some("on"),
+            );
         }
     }
     Redirect::to("/").into_response()
