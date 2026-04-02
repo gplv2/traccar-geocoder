@@ -15,8 +15,11 @@
 #include <osmium/visitor.hpp>
 #include <osmium/handler/node_locations_for_ways.hpp>
 #include <fcntl.h>
+#include <iomanip>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <osmium/index/map/sparse_file_array.hpp>
+#include <osmium/index/map/sparse_mem_array.hpp>
 #include <osmium/area/assembler.hpp>
 #include <osmium/area/multipolygon_manager.hpp>
 #include <osmium/area/problem_reporter_stream.hpp>
@@ -126,6 +129,7 @@ static int kAdminCellLevel = 10;
 // Diagnostic flags and counters
 static bool verbose = false;
 static bool debug = false;
+static bool in_memory = false;
 
 static uint64_t admin_stored = 0;
 static uint64_t admin_s2_direct = 0;
@@ -136,6 +140,12 @@ static uint64_t admin_too_few_points = 0;
 static uint64_t admin_invalid_nodes_skipped = 0;
 
 static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2) {
+    static S2RegionCoverer coverer([](){
+        S2RegionCoverer::Options options;
+        options.set_fixed_level(kStreetCellLevel);
+        return options;
+    }());
+
     S2Point p1 = S2LatLng::FromDegrees(lat1, lng1).ToPoint();
     S2Point p2 = S2LatLng::FromDegrees(lat2, lng2).ToPoint();
 
@@ -145,11 +155,6 @@ static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, d
 
     std::vector<S2Point> points = {p1, p2};
     S2Polyline polyline(points);
-
-    S2RegionCoverer::Options options;
-    options.set_fixed_level(kStreetCellLevel);
-
-    S2RegionCoverer coverer(options);
     S2CellUnion covering = coverer.GetCovering(polyline);
     return covering.cell_ids();
 }
@@ -175,11 +180,12 @@ static std::vector<std::pair<S2CellId, bool>> cover_polygon_bbox(
         S2LatLng::FromDegrees(min_lat, min_lng),
         S2LatLng::FromDegrees(max_lat, max_lng));
 
-    S2RegionCoverer::Options options;
-    options.set_fixed_level(kAdminCellLevel);
-    options.set_max_cells(500);
-
-    S2RegionCoverer coverer(options);
+    static S2RegionCoverer coverer([](){
+        S2RegionCoverer::Options options;
+        options.set_fixed_level(kAdminCellLevel);
+        options.set_max_cells(500);
+        return options;
+    }());
     S2CellUnion covering = coverer.GetCovering(rect);
 
     std::vector<std::pair<S2CellId, bool>> result;
@@ -255,11 +261,12 @@ static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<st
         }
     }
 
-    S2RegionCoverer::Options options;
-    options.set_max_level(kAdminCellLevel);
-    options.set_max_cells(200);
-
-    S2RegionCoverer coverer(options);
+    static S2RegionCoverer coverer([](){
+        S2RegionCoverer::Options options;
+        options.set_max_level(kAdminCellLevel);
+        options.set_max_cells(200);
+        return options;
+    }());
     S2CellUnion covering = coverer.GetCovering(polygon);
     S2CellUnion interior = coverer.GetInteriorCovering(polygon);
 
@@ -402,16 +409,13 @@ static std::vector<std::pair<double,double>> simplify_polygon(
 
 // --- Highway filter ---
 
-static const std::vector<std::string> kExcludedHighways = {
+static const std::unordered_set<std::string> kExcludedHighways = {
     "footway", "path", "track", "steps", "cycleway",
     "service", "pedestrian", "bridleway", "construction"
 };
 
 static bool is_included_highway(const char* value) {
-    for (const auto& excluded : kExcludedHighways) {
-        if (excluded == value) return false;
-    }
-    return true;
+    return kExcludedHighways.find(value) == kExcludedHighways.end();
 }
 
 // --- Parse house number (leading digits) ---
@@ -936,11 +940,34 @@ static void write_index(const std::string& output_dir) {
 
 }
 
+// --- Capacity estimation from PBF file size ---
+
+struct SizeEstimate {
+    size_t ways;
+    size_t addr_points;
+    size_t street_nodes;
+    size_t admin_polygons;
+    size_t admin_vertices;
+};
+
+static SizeEstimate estimate_from_file_size(size_t total_bytes) {
+    double gb = total_bytes / (1024.0 * 1024.0 * 1024.0);
+    // Conservative per-GB ratios from Italy/France/Benelux testing
+    // with 20% headroom to avoid reallocations
+    return {
+        static_cast<size_t>(gb * 900000),    // ways (~870K/GB observed)
+        static_cast<size_t>(gb * 7500000),   // addr_points (highly variable, use high estimate)
+        static_cast<size_t>(gb * 4500000),   // street_nodes (~3-5 nodes per way)
+        static_cast<size_t>(gb * 15000),     // admin_polygons
+        static_cast<size_t>(gb * 500000),    // admin_vertices
+    };
+}
+
 // --- Main ---
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--verbose] [--debug]" << std::endl;
+        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--verbose] [--debug] [--in-memory]" << std::endl;
         return 1;
     }
 
@@ -957,8 +984,32 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--debug") {
             debug = true;
             verbose = true;
+        } else if (arg == "--in-memory") {
+            in_memory = true;
         } else {
             input_files.push_back(arg);
+        }
+    }
+
+    // Pre-allocate vectors based on total PBF file size
+    size_t total_pbf_bytes = 0;
+    for (const auto& input_file : input_files) {
+        struct stat st;
+        if (stat(input_file.c_str(), &st) == 0) {
+            total_pbf_bytes += st.st_size;
+        }
+    }
+    if (total_pbf_bytes > 0) {
+        auto est = estimate_from_file_size(total_pbf_bytes);
+        ways.reserve(est.ways);
+        addr_points.reserve(est.addr_points);
+        street_nodes.reserve(est.street_nodes);
+        admin_polygons.reserve(est.admin_polygons);
+        admin_vertices.reserve(est.admin_vertices);
+        if (verbose) {
+            double gb = total_pbf_bytes / (1024.0 * 1024.0 * 1024.0);
+            std::cerr << "Pre-allocated for " << std::fixed << std::setprecision(1)
+                      << gb << " GB of PBF data" << std::endl;
         }
     }
 
@@ -979,7 +1030,7 @@ int main(int argc, char* argv[]) {
         osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
 
         {
-            osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation};
+            osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation, osmium::io::read_meta::no};
             osmium::apply(reader1, mp_manager);
             reader1.close();
             mp_manager.prepare_for_lookup();
@@ -988,24 +1039,39 @@ int main(int argc, char* argv[]) {
         // --- Pass 2: process all data ---
         std::cerr << "  Pass 2: processing nodes, ways, and areas..." << std::endl;
 
-        using index_type = osmium::index::map::SparseFileArray<
-            osmium::unsigned_object_id_type, osmium::Location>;
-        using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
+        if (in_memory) {
+            using index_type = osmium::index::map::SparseMemArray<
+                osmium::unsigned_object_id_type, osmium::Location>;
+            using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
-        std::string tmp_path = output_dir + "/node_locations.tmp";
-        int fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-        index_type index{fd};
-        location_handler_type location_handler{index};
-        location_handler.ignore_errors();
+            index_type index;
+            location_handler_type location_handler{index};
+            location_handler.ignore_errors();
 
-        osmium::io::Reader reader2{input_file};
+            osmium::io::Reader reader2{input_file, osmium::io::read_meta::no};
+            osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
+                osmium::apply(buffer, handler);
+            }));
+            reader2.close();
+        } else {
+            using index_type = osmium::index::map::SparseFileArray<
+                osmium::unsigned_object_id_type, osmium::Location>;
+            using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
-        osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
-            osmium::apply(buffer, handler);
-        }));
-        reader2.close();
-        close(fd);
-        std::remove(tmp_path.c_str());
+            std::string tmp_path = output_dir + "/node_locations.tmp";
+            int fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+            index_type index{fd};
+            location_handler_type location_handler{index};
+            location_handler.ignore_errors();
+
+            osmium::io::Reader reader2{input_file, osmium::io::read_meta::no};
+            osmium::apply(reader2, location_handler, handler, mp_manager.handler([&handler](osmium::memory::Buffer&& buffer) {
+                osmium::apply(buffer, handler);
+            }));
+            reader2.close();
+            close(fd);
+            std::remove(tmp_path.c_str());
+        }
     }
 
     std::cerr << "Done reading:" << std::endl;
