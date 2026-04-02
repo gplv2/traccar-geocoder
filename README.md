@@ -68,13 +68,18 @@ PBF files can be downloaded from [Geofabrik](https://download.geofabrik.de/).
 
 ### Disk and Memory Requirements
 
-| Extract | PBF Size | Index Size | RAM (file-backed) | RAM (--in-memory) |
-|---------|----------|------------|--------------------|--------------------|
-| Monaco | 2 MB | ~10 MB | < 1 GB | < 1 GB |
-| Belgium | 765 MB | ~200 MB | 2 GB | 4 GB |
-| France | 4.7 GB | ~1 GB | 4 GB | 20 GB |
-| Italy | 2.1 GB | ~500 MB | 4 GB | 12 GB |
-| Europe | 32 GB | ~7 GB | 8 GB + swap | 74 GB |
+| Extract | PBF Size | Index Size | Temp file | RAM (file-backed) | RAM (--in-memory) |
+|---------|----------|------------|-----------|--------------------|--------------------|
+| Monaco | 2 MB | ~10 MB | ~50 MB | < 1 GB | < 1 GB |
+| Belgium | 765 MB | ~200 MB | ~4 GB | 2 GB | 4 GB |
+| France | 4.7 GB | ~1 GB | ~20 GB | 4 GB | 20 GB |
+| Italy | 2.1 GB | ~500 MB | ~10 GB | 4 GB | 12 GB |
+| Europe | 32 GB | ~7 GB | ~55 GB | 8 GB + swap | 74 GB (measured) |
+| Planet | ~70 GB | ~18 GB | ~134 GB | 16 GB + swap | ~174 GB (estimated) |
+
+RAM estimates for `--in-memory` are based on ~16 bytes per node for the SparseMemArray index. Europe has 3.7 billion nodes (55 GB index + 19 GB other structures). Planet has ~9 billion nodes (134 GB index + ~40 GB other structures).
+
+The "Temp file" column shows the `node_locations.tmp` size when using the default file-backed mode. For large builds on machines with limited RAM, use `--tmpdir` to place this file on fast local storage (NVMe) rather than the output directory.
 
 For high performance, use NVMe storage or a machine with enough RAM for `--in-memory` mode.
 
