@@ -473,6 +473,13 @@ This fallback:
 - Has zero runtime cost for the happy path (most queries find country from the index)
 - Works regardless of which PBF extract was used to build the index
 - Covers all countries worldwide, not just those affected by the extract issue
+- **Enabled by default**; disable with `--no-country-fallback` when building from planet PBF
+
+When building from `planet-latest.osm.pbf`, all boundary relations are complete and the fallback is unnecessary. Use `--no-country-fallback` to skip loading the embedded dataset and save ~1 MB of memory:
+
+```bash
+query-server /data/geocoder/index 0.0.0.0:3000 --no-country-fallback
+```
 
 ### Conclusion
 

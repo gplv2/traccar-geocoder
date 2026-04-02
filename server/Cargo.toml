@@ -15,6 +15,7 @@ rustls-acme = { version = "0.14", features = ["axum"] }
 axum-server = "0.7"
 bcrypt = "0.15"
 getrandom = "0.2"
+country-boundaries = "1"
 
 [dev-dependencies]
 axum-test = "16"
