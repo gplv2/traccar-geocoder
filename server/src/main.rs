@@ -1513,10 +1513,12 @@ mod tests {
     }
 
     #[test]
-    fn rate_limiter_zero_limit_blocks_immediately() {
+    fn rate_limiter_zero_means_unlimited() {
         let limiter = auth::RateLimiter::default();
-        let result = auth::check_rate(&limiter, "user3", 0, 0);
-        assert!(result.is_err(), "zero limit should block immediately");
+        // 0 = unlimited (no rate limiting applied)
+        for _ in 0..100 {
+            assert!(auth::check_rate(&limiter, "user3", 0, 0).is_ok());
+        }
     }
 
     #[test]

@@ -144,12 +144,12 @@ pub fn check_rate(
     }
 
     rate.second_count += 1;
-    if rate.second_count > rate_per_second {
+    if rate_per_second > 0 && rate.second_count > rate_per_second {
         return Err("Rate limit exceeded (per second)");
     }
 
     rate.day_count += 1;
-    if rate.day_count > rate_per_day {
+    if rate_per_day > 0 && rate.day_count > rate_per_day {
         return Err("Rate limit exceeded (per day)");
     }
 
