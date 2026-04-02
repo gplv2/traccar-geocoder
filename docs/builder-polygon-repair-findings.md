@@ -373,3 +373,108 @@ Full Europe build on the dev server using all optimizations.
 The 9x speedup comes primarily from eliminating random I/O on the node location temp file. On the Linode, the 56 GB temp file far exceeded RAM, turning every node location lookup into a random read on block storage. With `--in-memory`, all lookups are RAM-resident.
 
 **Note:** The two environments differ in CPU, RAM, and storage, so this is not an apples-to-apples comparison of the code changes alone. The `--in-memory` flag is the dominant factor -- it eliminates the I/O bottleneck that caused the 28-hour build time. On the same Linode hardware, the file-backed path with the other optimizations (read_meta::no, coverer reuse, pre-allocation) would still be I/O-bound but somewhat faster than the upstream builder.
+
+---
+
+## Why Country Data Is Still Missing from Continent Extracts
+
+### The problem
+
+When building from `europe-latest.osm.pbf`, several countries return no `country` or `country_code` field in query results, even though all other admin levels (state, county, city, postcode) are present. Affected countries include France, Spain, and any nation whose admin_level=2 boundary polygon includes territory outside the geographic scope of the extract.
+
+This is a **different problem** from the polygon repair issue described above. The repair pipeline fixes geometrically broken polygons (self-intersecting edges from simplification). This is a data completeness issue where entire way segments are absent from the extract.
+
+### Root cause: how PBF extracts are cut
+
+Geofabrik produces two kinds of extracts, and they are cut differently:
+
+**Country extracts** (e.g., `france-latest.osm.pbf`):
+- Cut using the country's own admin boundary as the clipping polygon
+- All relation members (ways and nodes) that belong to relations intersecting the extract are included, even if they are geographically outside the country's mainland
+- France's admin_level=2 relation (r2202162) is **complete** -- all 1,759 outer ways and their nodes are present, including those in Reunion, Guadeloupe, French Guiana, and other overseas territories
+- The assembler can close all rings and produce a valid area
+
+**Continent extracts** (e.g., `europe-latest.osm.pbf`):
+- Cut using Europe's geographic boundary
+- Overseas territories (Indian Ocean, Caribbean, South America) are **outside the cutting polygon**
+- The France relation r2202162 is present in the extract (because most of its members are in Europe), but approximately 15 of its 1,759 outer ways are missing -- the ones that trace coastlines in Reunion, Guadeloupe, Martinique, French Guiana, etc.
+- The assembler cannot close the ring when way segments are missing, so it **rejects the entire relation**
+- No area is produced, no polygon enters the builder pipeline, nothing to repair
+
+### Why the builder repair pipeline cannot fix this
+
+The three-tier repair pipeline (S2Loop > S2Builder > bbox fallback) operates on polygons that have been assembled but have invalid geometry. In this case, the polygon is never assembled at all:
+
+```
+Continent extract flow for France admin_level=2:
+
+  Relation r2202162 present in PBF ---- yes
+  All 1,759 outer ways present? ------- no (~15 missing, overseas territories)
+  Assembler can close outer ring? ------ no (gaps where ways are missing)
+  Assembler produces area? ------------- no (rejects relation entirely)
+  Area handler receives polygon? ------- no
+  Repair pipeline invoked? ------------- no (nothing to repair)
+```
+
+The `ignore_invalid_locations` flag on the assembler helps with individual nodes that have bad coordinates (common at extract edges). It does not help when entire ways are absent -- the ring simply has gaps that cannot be bridged.
+
+### Verification
+
+This was verified by inspecting the Europe PBF directly using `osmium`:
+
+```
+$ osmium getid europe-latest.osm.pbf r2202162 -f debug
+
+relation 2202162
+  tags:
+    "boundary" = "administrative"
+    "admin_level" = "2"
+    "ISO3166-1:alpha2" = "FR"
+    "type" = "boundary"
+    "name" = "France"
+  members: 1793 (1,759 outer, 19 inner, 15 other)
+```
+
+The relation exists with all its tags, but member ways referencing nodes in overseas territories are not resolvable within the extract.
+
+Building from the Europe PBF with `--verbose` confirmed: zero invalid nodes were skipped for admin boundaries (the `admin_invalid_nodes_skipped` counter was 0), meaning the assembler never even produced a partial area for France -- it rejected the relation before our handler saw it.
+
+### Countries affected
+
+Any country whose admin_level=2 boundary relation includes ways outside the continent extract:
+
+| Country | Overseas territory | In Europe extract? |
+|---|---|---|
+| France | Reunion, Guadeloupe, Martinique, French Guiana, Mayotte, Saint-Pierre-et-Miquelon | No |
+| Spain | Canary Islands, Ceuta, Melilla | Partially (Canaries are borderline) |
+| Netherlands | Aruba, Curacao, Sint Maarten, Caribbean Netherlands | No |
+| Denmark | Greenland, Faroe Islands | No (Faroe borderline) |
+| Portugal | Azores, Madeira | Borderline |
+
+Countries whose territory is fully within the continent extract (Belgium, Germany, Italy, Austria, Switzerland, etc.) are unaffected.
+
+### Solution: server-side country boundary fallback
+
+Since the builder cannot fix incomplete relations (the data simply isn't in the PBF), the solution is a server-side fallback that provides country information when the primary S2-based admin lookup returns no country.
+
+The `country-boundaries` crate embeds a pre-computed global boundary dataset (~1 MB) directly into the server binary. When `find_admin()` returns no country for a coordinate, the fallback performs a point-in-boundary lookup against this embedded dataset to determine the country code, then maps it to a country name.
+
+This fallback:
+- Only triggers when the primary lookup has no country (existing results are never overridden)
+- Adds ~1 MB to the binary size
+- Has zero runtime cost for the happy path (most queries find country from the index)
+- Works regardless of which PBF extract was used to build the index
+- Covers all countries worldwide, not just those affected by the extract issue
+
+### Conclusion
+
+There are **two distinct problems** causing missing admin boundary data, and they require **two distinct solutions**:
+
+| Problem | Cause | Scope | Solution |
+|---|---|---|---|
+| **Geometrically broken polygons** | Aggressive simplification (500 vertices) creates self-intersecting edges; S2 validation silently drops them | All PBF types (country, continent, planet) | **Builder repair pipeline**: S2Builder `split_crossing_edges`, raised vertex limit to 10K |
+| **Incomplete boundary relations** | Continent/regional extracts exclude ways for overseas territories; assembler cannot close rings with missing segments | Continent and regional extracts only | **Server-side fallback**: `country-boundaries` crate with embedded global dataset |
+
+Building from a planet PBF (`planet-latest.osm.pbf`) would avoid the second problem entirely, since all ways and nodes are present. However, planet builds are significantly more resource-intensive (65+ GB PBF, requires 100+ GB RAM for in-memory index). For most deployments using continent or regional extracts, the server-side fallback is the practical solution.
+
+The upstream project was advised of both issues. The builder polygon repair was acknowledged but the maintainer suggested incorporating the fallback into the index rather than the server, without addressing the fundamental constraint that the builder cannot synthesize data that isn't in the source PBF. This fork implements both solutions independently.
