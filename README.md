@@ -165,6 +165,8 @@ The builder produces 14 binary files:
 **Server (Rust):**
 - Rust toolchain (stable)
 
+Tested on aarch64 (Apple Silicon, ARM64) and x86_64 (AMD64) platforms. Index files are portable between both architectures (little-endian, IEEE 754 floats, no padding differences in the binary structs).
+
 ### Build
 
 ```bash
