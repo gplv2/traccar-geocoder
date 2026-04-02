@@ -16,6 +16,10 @@ axum-server = "0.7"
 bcrypt = "0.15"
 getrandom = "0.2"
 
+[dev-dependencies]
+axum-test = "16"
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = true

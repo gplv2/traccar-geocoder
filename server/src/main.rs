@@ -967,3 +967,384 @@ async fn main() {
         .unwrap();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    // --- format_address edge cases ---
+
+    fn addr(
+        hn: Option<&str>,
+        road: Option<&str>,
+        city: Option<&str>,
+        state: Option<&str>,
+        county: Option<&str>,
+        postcode: Option<&str>,
+        country: Option<&str>,
+        cc: Option<&str>,
+    ) -> AddressDetails<'static> {
+        AddressDetails {
+            house_number: hn.map(|s| Cow::Owned(s.to_string())),
+            road: road.map(|s| Box::leak(s.to_string().into_boxed_str()) as &str),
+            city: city.map(|s| Box::leak(s.to_string().into_boxed_str()) as &str),
+            state: state.map(|s| Box::leak(s.to_string().into_boxed_str()) as &str),
+            county: county.map(|s| Box::leak(s.to_string().into_boxed_str()) as &str),
+            postcode: postcode.map(|s| Box::leak(s.to_string().into_boxed_str()) as &str),
+            country: country.map(|s| Box::leak(s.to_string().into_boxed_str()) as &str),
+            country_code: cc.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn format_address_all_none_returns_none() {
+        let a = addr(None, None, None, None, None, None, None, None);
+        assert_eq!(format_address(&a), None);
+    }
+
+    #[test]
+    fn format_address_only_country() {
+        let a = addr(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("France"),
+            Some("FR"),
+        );
+        assert_eq!(format_address(&a).unwrap(), "France");
+    }
+
+    #[test]
+    fn format_address_only_road_no_number() {
+        let a = addr(
+            None,
+            Some("Rue de Rivoli"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(format_address(&a).unwrap(), "Rue de Rivoli");
+    }
+
+    #[test]
+    fn format_address_european_number_after_street() {
+        let a = addr(
+            Some("42"),
+            Some("Rue de Rivoli"),
+            Some("Paris"),
+            None,
+            None,
+            Some("75001"),
+            Some("France"),
+            Some("FR"),
+        );
+        let result = format_address(&a).unwrap();
+        assert!(result.starts_with("Rue de Rivoli 42"), "got: {}", result);
+        assert!(result.contains("75001 Paris"), "got: {}", result);
+        assert!(result.ends_with("France"), "got: {}", result);
+    }
+
+    #[test]
+    fn format_address_us_number_before_street() {
+        let a = addr(
+            Some("1600"),
+            Some("Pennsylvania Avenue"),
+            Some("Washington"),
+            Some("DC"),
+            None,
+            Some("20500"),
+            Some("United States"),
+            Some("US"),
+        );
+        let result = format_address(&a).unwrap();
+        assert!(
+            result.starts_with("1600 Pennsylvania Avenue"),
+            "got: {}",
+            result
+        );
+        assert!(result.contains("Washington"), "got: {}", result);
+        assert!(result.contains("DC"), "got: {}", result);
+    }
+
+    #[test]
+    fn format_address_unicode_characters() {
+        let a = addr(
+            Some("29"),
+            Some("Grand-Place - Grote Markt"),
+            Some("Bruxelles - Brussel"),
+            Some("Region de Bruxelles-Capitale"),
+            None,
+            Some("1000"),
+            Some("Belgie / Belgique / Belgien"),
+            Some("BE"),
+        );
+        let result = format_address(&a).unwrap();
+        assert!(result.contains("Grand-Place"), "got: {}", result);
+        assert!(
+            result.contains("Belgie / Belgique / Belgien"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn format_address_empty_strings_treated_as_present() {
+        let a = addr(Some(""), Some(""), None, None, None, None, Some("X"), None);
+        let result = format_address(&a).unwrap();
+        assert!(result.contains("X"), "got: {}", result);
+    }
+
+    #[test]
+    fn format_address_only_city_and_postcode() {
+        let a = addr(
+            None,
+            None,
+            Some("Lyon"),
+            None,
+            None,
+            Some("69001"),
+            None,
+            Some("FR"),
+        );
+        let result = format_address(&a).unwrap();
+        assert!(result.contains("Lyon"), "got: {}", result);
+        assert!(result.contains("69001"), "got: {}", result);
+    }
+
+    #[test]
+    fn format_address_no_city_block_no_trailing_comma() {
+        let a = addr(
+            Some("1"),
+            Some("Main St"),
+            None,
+            None,
+            None,
+            None,
+            Some("Germany"),
+            Some("DE"),
+        );
+        let result = format_address(&a).unwrap();
+        assert!(!result.contains(", ,"), "dangling comma in: {}", result);
+        assert!(!result.ends_with(", "), "trailing comma in: {}", result);
+        assert_eq!(result, "Main St 1, Germany");
+    }
+
+    #[test]
+    fn format_address_japan_postcode_before_city() {
+        let a = addr(
+            Some("1-1"),
+            Some("Chiyoda"),
+            Some("Tokyo"),
+            Some("Tokyo-to"),
+            None,
+            Some("100-0001"),
+            Some("Japan"),
+            Some("JP"),
+        );
+        let result = format_address(&a).unwrap();
+        assert!(result.starts_with("1-1 Chiyoda"), "got: {}", result);
+        let city_part = result.split(", ").nth(1).unwrap_or("");
+        assert!(
+            city_part.starts_with("100-0001"),
+            "postcode should be before city, got: {}",
+            result
+        );
+    }
+
+    // --- format_rules ---
+
+    #[test]
+    fn format_rules_unknown_country_defaults_to_european() {
+        let (number_after, postcode_before, include_state) = format_rules(None);
+        assert!(number_after, "default should be number after street");
+        assert!(postcode_before, "default should be postcode before city");
+        assert!(!include_state, "default should not include state");
+    }
+
+    #[test]
+    fn format_rules_us_number_before_street() {
+        let (number_after, _, include_state) = format_rules(Some("US"));
+        assert!(!number_after, "US should be number before street");
+        assert!(include_state, "US should include state");
+    }
+
+    // --- Auth: token validation ---
+
+    #[test]
+    fn validate_token_missing_returns_none() {
+        let db = auth::Db::default();
+        assert!(db.validate_token("nonexistent").is_none());
+    }
+
+    #[test]
+    fn validate_token_empty_string_returns_none() {
+        let db = auth::Db::default();
+        assert!(db.validate_token("").is_none());
+    }
+
+    #[test]
+    fn validate_token_orphaned_token_returns_none() {
+        let json = r#"{"users":{},"tokens":{"key123":"ghost_user"}}"#;
+        let db: auth::Db = serde_json::from_str(json).unwrap();
+        assert!(db.validate_token("key123").is_none());
+    }
+
+    #[test]
+    fn validate_token_valid_returns_user_info() {
+        let json = r#"{
+            "users":{"alice":{"password_hash":"x","admin":false,"rate_per_second":10,"rate_per_day":1000,"rate_by_ip":false}},
+            "tokens":{"tok_abc":"alice"}
+        }"#;
+        let db: auth::Db = serde_json::from_str(json).unwrap();
+        let (login, rps, rpd, by_ip) = db.validate_token("tok_abc").unwrap();
+        assert_eq!(login, "alice");
+        assert_eq!(rps, 10);
+        assert_eq!(rpd, 1000);
+        assert!(!by_ip);
+    }
+
+    // --- Auth: rate limiter ---
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let limiter = auth::RateLimiter::default();
+        for _ in 0..10 {
+            assert!(auth::check_rate(&limiter, "user1", 10, 1000).is_ok());
+        }
+    }
+
+    #[test]
+    fn rate_limiter_blocks_over_per_second() {
+        let limiter = auth::RateLimiter::default();
+        assert!(auth::check_rate(&limiter, "user2", 2, 10000).is_ok());
+        assert!(auth::check_rate(&limiter, "user2", 2, 10000).is_ok());
+        let result = auth::check_rate(&limiter, "user2", 2, 10000);
+        assert!(result.is_err(), "should be rate limited");
+    }
+
+    #[test]
+    fn rate_limiter_zero_limit_blocks_immediately() {
+        let limiter = auth::RateLimiter::default();
+        let result = auth::check_rate(&limiter, "user3", 0, 0);
+        assert!(result.is_err(), "zero limit should block immediately");
+    }
+
+    #[test]
+    fn rate_limiter_separate_users_independent() {
+        let limiter = auth::RateLimiter::default();
+        assert!(auth::check_rate(&limiter, "user_a", 1, 10000).is_ok());
+        assert!(auth::check_rate(&limiter, "user_a", 1, 10000).is_err());
+        assert!(auth::check_rate(&limiter, "user_b", 1, 10000).is_ok());
+    }
+
+    // --- Auth: DB deserialization edge cases ---
+
+    #[test]
+    fn db_load_empty_json() {
+        let db: auth::Db = serde_json::from_str("{}").unwrap();
+        assert!(db.validate_token("anything").is_none());
+    }
+
+    #[test]
+    fn db_load_nonexistent_path_defaults() {
+        let db = auth::Db::load("/nonexistent/path/geocoder.json");
+        assert!(db.validate_token("anything").is_none());
+    }
+
+    // --- Coordinate validation ---
+
+    fn is_valid_coordinate(lat: f64, lon: f64) -> bool {
+        lat.is_finite()
+            && lon.is_finite()
+            && lat >= -90.0
+            && lat <= 90.0
+            && lon >= -180.0
+            && lon <= 180.0
+    }
+
+    #[test]
+    fn coords_valid_bounds() {
+        assert!(is_valid_coordinate(0.0, 0.0));
+        assert!(is_valid_coordinate(90.0, 180.0));
+        assert!(is_valid_coordinate(-90.0, -180.0));
+        assert!(is_valid_coordinate(51.5074, -0.1278));
+    }
+
+    #[test]
+    fn coords_lat_out_of_bounds() {
+        assert!(!is_valid_coordinate(90.1, 0.0));
+        assert!(!is_valid_coordinate(-90.1, 0.0));
+        assert!(!is_valid_coordinate(91.0, 0.0));
+        assert!(!is_valid_coordinate(-91.0, 0.0));
+        assert!(!is_valid_coordinate(1000.0, 0.0));
+    }
+
+    #[test]
+    fn coords_lon_out_of_bounds() {
+        assert!(!is_valid_coordinate(0.0, 180.1));
+        assert!(!is_valid_coordinate(0.0, -180.1));
+        assert!(!is_valid_coordinate(0.0, 360.0));
+    }
+
+    #[test]
+    fn coords_nan_rejected() {
+        assert!(!is_valid_coordinate(f64::NAN, 0.0));
+        assert!(!is_valid_coordinate(0.0, f64::NAN));
+        assert!(!is_valid_coordinate(f64::NAN, f64::NAN));
+    }
+
+    #[test]
+    fn coords_infinity_rejected() {
+        assert!(!is_valid_coordinate(f64::INFINITY, 0.0));
+        assert!(!is_valid_coordinate(f64::NEG_INFINITY, 0.0));
+        assert!(!is_valid_coordinate(0.0, f64::INFINITY));
+    }
+
+    #[test]
+    fn coords_negative_zero_accepted() {
+        assert!(is_valid_coordinate(-0.0, -0.0));
+    }
+
+    #[test]
+    fn coords_subnormal_accepted() {
+        assert!(is_valid_coordinate(f64::MIN_POSITIVE, f64::MIN_POSITIVE));
+    }
+
+    // --- Address serialization ---
+
+    #[test]
+    fn address_empty_omits_all_fields() {
+        let a = Address::default();
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, r#"{"address":{}}"#);
+    }
+
+    #[test]
+    fn address_serializes_country_code_as_string() {
+        let a = Address {
+            display_name: None,
+            address: addr(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("France"),
+                Some("FR"),
+            ),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["address"]["country_code"], "FR");
+        assert_eq!(v["address"]["country"], "France");
+        assert!(v.get("display_name").is_none() || v["display_name"].is_null());
+    }
+}

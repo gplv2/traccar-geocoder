@@ -51,7 +51,9 @@ pub type RateLimiter = RwLock<HashMap<String, Arc<RateState>>>;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Db {
+    #[serde(default)]
     users: HashMap<String, User>,
+    #[serde(default)]
     tokens: HashMap<String, String>, // token -> login
     #[serde(skip)]
     sessions: HashMap<String, String>, // session_id -> login (in-memory only)
@@ -142,12 +144,12 @@ pub fn check_rate(
     }
 
     rate.second_count += 1;
-    if rate_per_second > 0 && rate.second_count > rate_per_second {
+    if rate.second_count > rate_per_second {
         return Err("Rate limit exceeded (per second)");
     }
 
     rate.day_count += 1;
-    if rate_per_day > 0 && rate.day_count > rate_per_day {
+    if rate.day_count > rate_per_day {
         return Err("Rate limit exceeded (per day)");
     }
 
