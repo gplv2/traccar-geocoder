@@ -2,15 +2,19 @@
 
 A fast, self-hosted reverse geocoding service built from OpenStreetMap data. Given latitude and longitude coordinates, it returns the nearest street address including house number, street name, city, state, county, postcode, and country.
 
-Part of the [Traccar](https://www.traccar.org) open source GPS tracking platform. Also available as a [hosted service](https://www.traccar.org/product/geocoder/).
+This is a fork of [traccar/traccar-geocoder](https://github.com/traccar/traccar-geocoder) with polygon repair, performance optimizations, security fixes, and a country-boundaries fallback for continent-level PBF extracts. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ## Features
 
 - Street-level reverse geocoding from OSM data
 - Address point, street name, and address interpolation lookup
 - Administrative boundary resolution (country, state, county, city, postcode)
+- S2Builder polygon repair pipeline -- never silently drops admin boundaries
+- Country-boundaries fallback for continent/regional PBF extracts (France, Spain, Netherlands)
 - Sub-millisecond query latency with memory-mapped index files
+- In-memory node location index for fast builds on high-RAM machines
 - Automatic HTTPS with Let's Encrypt
+- Token-based authentication with per-user rate limiting
 - Docker support with automatic PBF download and indexing
 
 ## Quick Start
@@ -62,15 +66,25 @@ docker run -e PBF_URLS="https://planet.openstreetmap.org/pbf/planet-latest.osm.p
 
 PBF files can be downloaded from [Geofabrik](https://download.geofabrik.de/).
 
-The full earth index will take up around 18gb of disk space, so for high performance you want a machine with at least 16gb ram, or fast NVME storage.
+### Disk and Memory Requirements
+
+| Extract | PBF Size | Index Size | RAM (file-backed) | RAM (--in-memory) |
+|---------|----------|------------|--------------------|--------------------|
+| Monaco | 2 MB | ~10 MB | < 1 GB | < 1 GB |
+| Belgium | 765 MB | ~200 MB | 2 GB | 4 GB |
+| France | 4.7 GB | ~1 GB | 4 GB | 20 GB |
+| Italy | 2.1 GB | ~500 MB | 4 GB | 12 GB |
+| Europe | 32 GB | ~7 GB | 8 GB + swap | 74 GB |
+
+For high performance, use NVMe storage or a machine with enough RAM for `--in-memory` mode.
 
 ## API
 
 ### GET /reverse
 
 Query parameters:
-- `lat` - latitude (required)
-- `lon` - longitude (required)
+- `lat` - latitude (required, -90 to 90)
+- `lon` - longitude (required, -180 to 180)
 - `key` - API key (required)
 
 Example request:
@@ -97,10 +111,11 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 }
 ```
 
-Fields are omitted when not available.
+Fields are omitted when not available. The `display_name` field is formatted according to the country's addressing convention (e.g., number after street in Europe, before street in the US).
 
 Status codes:
-- `200` - success
+- `200` - success (application/json)
+- `400` - invalid coordinates (NaN, infinity, or out of range)
 - `401` - missing or invalid API key
 - `429` - rate limit exceeded
 
@@ -108,12 +123,14 @@ Status codes:
 
 The server includes a web dashboard for managing API keys. On first launch, navigate to the server URL in a browser to create an admin account. Once logged in, you can generate API keys and create additional users with configurable rate limits.
 
+Rate limits are per-user. Setting `rate_per_second` or `rate_per_day` to `0` means unlimited (no rate limiting applied). To revoke access, remove the user's token from the auth database.
+
 ## Architecture
 
 The project consists of two components:
 
-- **Builder** (C++) - Parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup.
-- **Server** (Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency.
+- **Builder** (C++) - Parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup. Includes a three-tier polygon repair pipeline (S2Loop > S2Builder > bounding-box fallback) that recovers invalid admin boundaries instead of silently dropping them.
+- **Server** (Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency. Includes an embedded country-boundaries fallback for when continent extracts have incomplete national boundaries.
 
 ### Index Structure
 
@@ -131,9 +148,9 @@ The builder produces 14 binary files:
 | `interp_ways.bin` | Interpolation way headers |
 | `interp_nodes.bin` | Interpolation node coordinates |
 | `admin_cells.bin` | S2 cell index for admin boundaries |
-| `admin_entries.bin` | Admin polygon IDs per cell |
-| `admin_polygons.bin` | Admin polygon metadata |
-| `admin_vertices.bin` | Admin polygon vertices |
+| `admin_entries.bin` | Admin polygon IDs per cell (high bit marks interior cells) |
+| `admin_polygons.bin` | Admin polygon metadata (name, level, area, country code) |
+| `admin_vertices.bin` | Admin polygon vertices for point-in-polygon tests |
 | `strings.bin` | Deduplicated string pool |
 
 ## Building from Source
@@ -143,32 +160,78 @@ The builder produces 14 binary files:
 **Builder (C++):**
 - CMake 3.16+
 - C++17 compiler
-- libosmium, protozero, s2geometry, zlib, bzip2, expat
+- libosmium2-dev, libprotozero-dev, libs2-dev, zlib1g-dev, libbz2-dev, libexpat1-dev, liblz4-dev
 
 **Server (Rust):**
-- Rust toolchain
+- Rust toolchain (stable)
 
 ### Build
 
 ```bash
 # Build the indexer
-mkdir build && cd build && cmake ../builder && make
+cd builder && mkdir -p build && cd build && cmake .. && make -j$(nproc)
 
 # Build the server
-cargo build --release --manifest-path server/Cargo.toml
+cd server && cargo build --release
 ```
 
-### Run
+### Builder Usage
+
+```
+build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--street-level N` | S2 cell level for streets (default: 17) |
+| `--admin-level N` | S2 cell level for admin boundaries (default: 10) |
+| `--verbose` | Per-polygon diagnostic output and pipeline summary counters |
+| `--debug` | Enable osmium assembler problem reporting (very verbose) |
+| `--in-memory` | Use RAM-backed node location index instead of disk-backed temp file. Eliminates `node_locations.tmp` I/O. Needs ~16 bytes per node (~40 GB for Europe, ~80 GB for planet). |
+| `--tmpdir DIR` | Place `node_locations.tmp` on a different filesystem. Useful when the output directory is on slow storage but fast local storage is available. Ignored when `--in-memory` is used. |
+
+Examples:
 
 ```bash
-# Create index from PBF file
-./build/build-index output-dir input.osm.pbf [input2.osm.pbf ...]
+# Basic build
+./build-index /data/index europe-latest.osm.pbf
 
-# Start the server
-./server/target/release/query-server output-dir [bind-address]
+# Multiple PBFs with diagnostics
+./build-index /data/index france.osm.pbf germany.osm.pbf --verbose
 
-# Start with automatic HTTPS
-./server/target/release/query-server output-dir --domain geocoder.example.com
+# Fast build on high-RAM machine (Europe, ~40 GB RAM needed)
+./build-index /data/index europe-latest.osm.pbf --in-memory --verbose
+
+# Cloud VM: output to block storage, temp file on local NVMe
+./build-index /mnt/block/index europe-latest.osm.pbf --tmpdir /mnt/nvme/tmp
+```
+
+### Server Usage
+
+```
+query-server <index-dir> [bind-address] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--street-level N` | S2 cell level for streets (default: 17, must match builder) |
+| `--admin-level N` | S2 cell level for admin boundaries (default: 10, must match builder) |
+| `--search-distance N` | Max search distance in degrees (default: 0.002) |
+| `--no-country-fallback` | Disable the embedded country boundary fallback. Use when building from planet PBF where all boundary relations are complete. |
+| `--domain DOMAIN` | Enable automatic HTTPS via Let's Encrypt ACME |
+| `--cache DIR` | ACME certificate cache directory (default: acme-cache) |
+
+Examples:
+
+```bash
+# Basic HTTP server
+./query-server /data/index 0.0.0.0:3000
+
+# With HTTPS
+./query-server /data/index --domain geocoder.example.com
+
+# Planet PBF build (all boundaries complete, no fallback needed)
+./query-server /data/index 0.0.0.0:3000 --no-country-fallback
 ```
 
 ## Environment Variables (Docker)
@@ -180,6 +243,17 @@ cargo build --release --manifest-path server/Cargo.toml
 | `BIND_ADDR` | HTTP bind address | `0.0.0.0:3000` |
 | `DATA_DIR` | Data directory for PBF files and index | `/data` |
 | `CACHE_DIR` | ACME certificate cache directory | `acme-cache` |
+| `STREET_LEVEL` | S2 cell level for streets | `17` |
+| `ADMIN_LEVEL` | S2 cell level for admin boundaries | `10` |
+| `SEARCH_DISTANCE` | Max search distance in degrees | `0.002` |
+
+## Known Limitations
+
+When building from continent or regional PBF extracts (e.g., `europe-latest.osm.pbf`), countries with overseas territories outside the extract boundary will have incomplete admin_level=2 boundary relations. The libosmium assembler cannot form closed polygon rings when member ways are missing, so these countries will have no `country` or `country_code` in query results.
+
+The server's country-boundaries fallback compensates for this at query time using an embedded global boundary dataset (~1 MB). This is enabled by default and covers all affected countries (France, Spain, Netherlands, and others with overseas territories).
+
+See [docs/builder-polygon-repair-findings.md](docs/builder-polygon-repair-findings.md) for a detailed analysis.
 
 ## License
 
