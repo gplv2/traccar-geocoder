@@ -1,0 +1,45 @@
+Traccar Geocoder
+Copyright 2024 Traccar Ltd
+https://github.com/traccar/traccar-geocoder
+
+This product includes software developed by Traccar Ltd.
+
+Licensed under the Apache License, Version 2.0.
+
+================================================================================
+
+This fork contains modifications by Glenn Plas (https://github.com/gplv2).
+Original source: https://github.com/traccar/traccar-geocoder
+
+Changes from the original:
+
+Builder (builder/src/build_index.cpp):
+- S2Builder polygon repair pipeline (three-tier: S2Loop > S2Builder > bbox fallback)
+- Raised simplification limit from 500 to 10,000 vertices
+- Lenient libosmium multipolygon assembly (ignore_invalid_locations)
+- Node location handler error tolerance (ignore_errors)
+- In-memory node location index (--in-memory flag, SparseMemArray)
+- Temp file directory override (--tmpdir flag)
+- Skip PBF metadata parsing (read_meta::no)
+- Reuse S2RegionCoverer instances (static initialization)
+- Highway filter using unordered_set (O(1) lookup)
+- Vector pre-allocation from PBF file size heuristics
+- Diagnostic counters and --verbose/--debug flags
+
+Server (server/src/main.rs):
+- Precomputed mmap slice lengths at load time
+- Eliminated redundant Vec allocation in cell neighbor lookup
+- Fixed street deduplication hash collisions in dense areas
+- Rewrote format_address to use single String buffer
+- Fixed rate limiter race condition (atomics replaced with Mutex)
+- Added bounds checking on all mmap slice accesses
+- Input validation for lat/lon parameters
+- Applied clippy lints and rustfmt formatting
+- Updated TLS dependencies for security fixes (RUSTSEC-2026-0044,
+  RUSTSEC-2026-0048, RUSTSEC-2026-0049)
+
+Server (server/src/auth.rs):
+- Applied clippy lints and rustfmt formatting
+
+Deployment (entrypoint.sh):
+- Positional parameters for safe argument passing
