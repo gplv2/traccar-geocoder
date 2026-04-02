@@ -492,4 +492,16 @@ There are **two distinct problems** causing missing admin boundary data, and the
 
 Building from a planet PBF (`planet-latest.osm.pbf`) would avoid the second problem entirely, since all ways and nodes are present. However, planet builds are significantly more resource-intensive (65+ GB PBF, requires 100+ GB RAM for in-memory index). For most deployments using continent or regional extracts, the server-side fallback is the practical solution.
 
-The upstream project was advised of both issues. The builder polygon repair was acknowledged but the maintainer suggested incorporating the fallback into the index rather than the server, without addressing the fundamental constraint that the builder cannot synthesize data that isn't in the source PBF. This fork implements both solutions independently.
+### Why this fork produces more complete results
+
+The upstream project was made aware of the missing country data issue through [PR #5](https://github.com/traccar/traccar-geocoder/pull/5). The maintainer's response was to "add it to the index instead" -- suggesting the builder should handle it during index creation. This reflects a misunderstanding of the problem.
+
+The index is built from PBF data. If the PBF data is incomplete -- which is inherent to any non-planet extract -- the builder cannot synthesize what isn't there. You cannot index data that doesn't exist in your source file.
+
+The suggestion implies that the builder should detect missing country boundaries and fill them in during index creation. But the builder processes OSM relations as they come from the PBF. When a relation's member ways are absent from the extract, the libosmium assembler cannot form a closed polygon ring. The relation is rejected before any builder code runs. There is no hook point where the builder could intervene, because there is no partial polygon to fix -- there is nothing at all.
+
+This was verified empirically: building from `france-latest.osm.pbf` (country extract) produces a complete France boundary. Building from `europe-latest.osm.pbf` produces no France boundary. Same builder, same code, same relation ID (r2202162). The only difference is whether the Geofabrik extract includes the ~15 coastal ways that trace France's overseas territories. The Europe extract does not, because those territories are not in Europe.
+
+The only place to compensate for missing source data is at query time, when you can compare the result against an independent dataset. That is exactly what the `country-boundaries` fallback does. It adds ~1 MB to the binary, has zero cost for queries that already have country data, and can be disabled with `--no-country-fallback` for planet PBF deployments where it is genuinely unnecessary.
+
+This fork addresses both problems: the builder repair pipeline fixes geometrically broken polygons that the upstream builder silently drops, and the server-side fallback fills in country data that no builder can produce from an incomplete extract.
