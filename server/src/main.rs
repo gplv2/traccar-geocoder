@@ -1630,4 +1630,142 @@ mod tests {
         assert_eq!(v["address"]["country"], "France");
         assert!(v.get("display_name").is_none() || v["display_name"].is_null());
     }
+
+    // --- Country code fallback ---
+
+    #[test]
+    fn country_code_to_name_known_codes() {
+        assert_eq!(country_code_to_name("FR"), Some("France"));
+        assert_eq!(country_code_to_name("DE"), Some("Deutschland"));
+        assert_eq!(country_code_to_name("US"), Some("United States"));
+        assert_eq!(country_code_to_name("JP"), Some("日本"));
+        assert_eq!(
+            country_code_to_name("BE"),
+            Some("België / Belgique / Belgien")
+        );
+    }
+
+    #[test]
+    fn country_code_to_name_unknown_returns_none() {
+        assert_eq!(country_code_to_name("XX"), None);
+        assert_eq!(country_code_to_name("ZZ"), None);
+        assert_eq!(country_code_to_name(""), None);
+    }
+
+    #[test]
+    fn country_code_to_name_case_sensitive() {
+        // The function expects uppercase codes
+        assert_eq!(country_code_to_name("fr"), None);
+        assert_eq!(country_code_to_name("Fr"), None);
+    }
+
+    #[test]
+    fn country_boundaries_fallback_resolves_france() {
+        use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
+        let cb = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).unwrap();
+
+        // Paris -- France mainland
+        let paris = LatLon::new(48.8566, 2.3522).unwrap();
+        let ids = cb.ids(paris);
+        let country = ids.iter().find(|id| id.len() == 2);
+        assert!(
+            country.is_some(),
+            "should find FR for Paris, got: {:?}",
+            ids
+        );
+        assert_eq!(
+            country.unwrap().to_ascii_uppercase(),
+            "FR",
+            "Paris should be FR"
+        );
+    }
+
+    #[test]
+    fn country_boundaries_fallback_resolves_spain() {
+        use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
+        let cb = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).unwrap();
+
+        // Madrid
+        let madrid = LatLon::new(40.4168, -3.7038).unwrap();
+        let ids = cb.ids(madrid);
+        let country = ids.iter().find(|id| id.len() == 2);
+        assert!(
+            country.is_some(),
+            "should find ES for Madrid, got: {:?}",
+            ids
+        );
+        assert_eq!(
+            country.unwrap().to_ascii_uppercase(),
+            "ES",
+            "Madrid should be ES"
+        );
+    }
+
+    #[test]
+    fn country_boundaries_fallback_resolves_netherlands() {
+        use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
+        let cb = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).unwrap();
+
+        // Amsterdam
+        let amsterdam = LatLon::new(52.3676, 4.9041).unwrap();
+        let ids = cb.ids(amsterdam);
+        let country = ids.iter().find(|id| id.len() == 2);
+        assert!(
+            country.is_some(),
+            "should find NL for Amsterdam, got: {:?}",
+            ids
+        );
+        assert_eq!(
+            country.unwrap().to_ascii_uppercase(),
+            "NL",
+            "Amsterdam should be NL"
+        );
+    }
+
+    #[test]
+    fn country_boundaries_fallback_overseas_territories() {
+        use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
+        let cb = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).unwrap();
+
+        // Reunion (French overseas department, Indian Ocean)
+        let reunion = LatLon::new(-21.1151, 55.5364).unwrap();
+        let ids = cb.ids(reunion);
+        let country = ids.iter().find(|id| id.len() == 2);
+        assert!(
+            country.is_some(),
+            "should find country for Reunion, got: {:?}",
+            ids
+        );
+        // Reunion may return RE or FR depending on the dataset
+        let code = country.unwrap().to_ascii_uppercase();
+        assert!(
+            code == "RE" || code == "FR",
+            "Reunion should be RE or FR, got: {}",
+            code
+        );
+    }
+
+    #[test]
+    fn country_boundaries_ocean_returns_no_country() {
+        use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
+        let cb = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).unwrap();
+
+        // Middle of the Atlantic
+        let ocean = LatLon::new(30.0, -40.0).unwrap();
+        let ids = cb.ids(ocean);
+        let country = ids.iter().find(|id| id.len() == 2);
+        assert!(
+            country.is_none(),
+            "ocean should have no country, got: {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn country_boundaries_dataset_loads() {
+        use country_boundaries::{CountryBoundaries, BOUNDARIES_ODBL_360X180};
+        // Verify the embedded dataset loads without panic
+        let result = CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180);
+        assert!(result.is_ok(), "dataset should load: {:?}", result.err());
+    }
 }
