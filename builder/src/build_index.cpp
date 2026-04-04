@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -125,12 +126,43 @@ static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 
 static int kStreetCellLevel = 17;
 static int kAdminCellLevel = 10;
+static size_t kMaxVertices = 50000;
 
 // Diagnostic flags and counters
 static bool verbose = false;
 static bool debug = false;
 static bool in_memory = false;
 static std::string tmp_dir;
+
+// Timer helper
+using Clock = std::chrono::steady_clock;
+using Duration = std::chrono::duration<double>;
+
+static std::string format_duration(double secs) {
+    char buf[64];
+    if (secs < 60) {
+        snprintf(buf, sizeof(buf), "%.1fs", secs);
+    } else if (secs < 3600) {
+        snprintf(buf, sizeof(buf), "%dm %ds", (int)(secs / 60), (int)secs % 60);
+    } else {
+        snprintf(buf, sizeof(buf), "%dh %dm %ds", (int)(secs / 3600), (int)(secs / 60) % 60, (int)secs % 60);
+    }
+    return buf;
+}
+
+static std::string format_rate(uint64_t count, double secs) {
+    char buf[64];
+    if (secs <= 0) return "N/A";
+    double per_sec = count / secs;
+    if (per_sec >= 1000000) {
+        snprintf(buf, sizeof(buf), "%.1fM/s", per_sec / 1000000);
+    } else if (per_sec >= 1000) {
+        snprintf(buf, sizeof(buf), "%.1fK/s", per_sec / 1000);
+    } else {
+        snprintf(buf, sizeof(buf), "%.0f/s", per_sec);
+    }
+    return buf;
+}
 
 static uint64_t admin_stored = 0;
 static uint64_t admin_s2_direct = 0;
@@ -198,7 +230,9 @@ static std::vector<std::pair<S2CellId, bool>> cover_polygon_bbox(
 }
 
 // Returns pairs of (cell_id, is_interior)
-static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair<double,double>>& vertices) {
+static std::vector<std::pair<S2CellId, bool>> cover_polygon(
+    const std::vector<std::pair<double,double>>& vertices,
+    const char* name = "", uint8_t admin_level = 0) {
     std::vector<S2Point> points;
     points.reserve(vertices.size());
     for (const auto& [lat, lng] : vertices) {
@@ -241,16 +275,16 @@ static std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<st
             polygon = std::move(repaired);
             admin_s2_repaired++;
             if (verbose) {
-                std::cerr << "  S2Builder repaired polygon ("
-                          << points.size() << " vertices): "
+                std::cerr << "  REPAIR: \"" << name << "\" (level " << (int)admin_level
+                          << ", " << points.size() << " vertices): "
                           << error << std::endl;
             }
         } else {
             // Last resort: bbox covering
             admin_bbox_fallback++;
             if (verbose) {
-                std::cerr << "  BBOX fallback (" << points.size()
-                          << " vertices): S2=" << error;
+                std::cerr << "  BBOX: \"" << name << "\" (level " << (int)admin_level
+                          << ", " << points.size() << " vertices): S2=" << error;
                 if (build_error.ok()) {
                     std::cerr << ", builder produced 0 loops";
                 } else {
@@ -459,11 +493,16 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
                                const char* name, uint8_t admin_level,
                                const char* country_code) {
     // Simplify large polygons
-    auto simplified = simplify_polygon(vertices, 10000);
+    auto simplified = simplify_polygon(vertices, kMaxVertices);
+    if (verbose && simplified.size() < vertices.size()) {
+        std::cerr << "  SIMPLIFY: \"" << name << "\" (level " << (int)admin_level
+                  << "): " << vertices.size() << " -> " << simplified.size()
+                  << " vertices" << std::endl;
+    }
     if (simplified.size() < 3) {
         admin_simplified_dropped++;
         if (verbose) {
-            std::cerr << "  DROP: " << name << " (level " << (int)admin_level
+            std::cerr << "  DROP: \"" << name << "\" (level " << (int)admin_level
                       << "): simplified from " << vertices.size() << " to "
                       << simplified.size() << " vertices" << std::endl;
         }
@@ -490,7 +529,7 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
     admin_stored++;
 
     // S2 cell coverage (high bit marks interior cells)
-    auto cell_ids = cover_polygon(simplified);
+    auto cell_ids = cover_polygon(simplified, name, admin_level);
     for (const auto& [cell_id, is_interior] : cell_ids) {
         uint32_t entry = is_interior ? (poly_id | INTERIOR_FLAG) : poly_id;
         cell_to_admin[cell_id.id()].push_back(entry);
@@ -856,14 +895,19 @@ static void write_cell_index(
 
 static void write_index(const std::string& output_dir) {
     // Merged geo cell index for streets, addresses, and interpolation
+    std::cerr << "  Merging geo cell keys..." << std::endl;
     std::set<uint64_t> all_geo_cells;
     for (const auto& [id, _] : cell_to_ways) all_geo_cells.insert(id);
     for (const auto& [id, _] : cell_to_addrs) all_geo_cells.insert(id);
     for (const auto& [id, _] : cell_to_interps) all_geo_cells.insert(id);
     std::vector<uint64_t> sorted_geo_cells(all_geo_cells.begin(), all_geo_cells.end());
+    std::cerr << "  " << sorted_geo_cells.size() << " geo cells merged" << std::endl;
 
+    std::cerr << "  Writing street_entries.bin..." << std::endl;
     auto street_offsets = write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, cell_to_ways);
+    std::cerr << "  Writing addr_entries.bin..." << std::endl;
     auto addr_offsets = write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, cell_to_addrs);
+    std::cerr << "  Writing interp_entries.bin..." << std::endl;
     auto interp_offsets = write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, cell_to_interps);
 
     {
@@ -881,61 +925,62 @@ static void write_index(const std::string& output_dir) {
         }
     }
 
-    std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
+    std::cerr << "  Writing geo_cells.bin..." << std::endl;
+    std::cerr << "  geo index: " << sorted_geo_cells.size() << " cells ("
               << ways.size() << " ways, "
               << addr_points.size() << " addrs, "
               << interp_ways.size() << " interps)" << std::endl;
 
+    std::cerr << "  Writing admin_cells.bin + admin_entries.bin..." << std::endl;
     write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", cell_to_admin);
-    std::cerr << "admin index: " << cell_to_admin.size() << " cells, " << admin_polygons.size() << " polygons" << std::endl;
+    std::cerr << "  admin index: " << cell_to_admin.size() << " cells, " << admin_polygons.size() << " polygons" << std::endl;
 
-    // Street ways
+    std::cerr << "  Writing street_ways.bin (" << ways.size() << " ways)..." << std::endl;
     {
         std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(ways.data()), ways.size() * sizeof(WayHeader));
     }
 
-    // Street nodes
+    std::cerr << "  Writing street_nodes.bin (" << street_nodes.size() << " nodes)..." << std::endl;
     {
         std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(street_nodes.data()), street_nodes.size() * sizeof(NodeCoord));
     }
 
-    // Address points
+    std::cerr << "  Writing addr_points.bin (" << addr_points.size() << " points)..." << std::endl;
     {
         std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(addr_points.data()), addr_points.size() * sizeof(AddrPoint));
     }
 
-    // Interpolation ways
+    std::cerr << "  Writing interp_ways.bin (" << interp_ways.size() << " ways)..." << std::endl;
     {
         std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(interp_ways.data()), interp_ways.size() * sizeof(InterpWay));
     }
 
-    // Interpolation nodes
+    std::cerr << "  Writing interp_nodes.bin (" << interp_nodes.size() << " nodes)..." << std::endl;
     {
         std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(interp_nodes.data()), interp_nodes.size() * sizeof(NodeCoord));
     }
 
-    // Admin polygons
+    std::cerr << "  Writing admin_polygons.bin (" << admin_polygons.size() << " polygons)..." << std::endl;
     {
         std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(admin_polygons.data()), admin_polygons.size() * sizeof(AdminPolygon));
     }
 
-    // Admin vertices
+    std::cerr << "  Writing admin_vertices.bin (" << admin_vertices.size() << " vertices)..." << std::endl;
     {
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(admin_vertices.data()), admin_vertices.size() * sizeof(NodeCoord));
     }
 
-    // Strings
+    std::cerr << "  Writing strings.bin (" << strings.data().size() / 1024 / 1024 << " MB)..." << std::endl;
     {
         std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
         f.write(strings.data().data(), strings.data().size());
-        std::cerr << "strings.bin: " << strings.data().size() << " bytes" << std::endl;
     }
 
 
@@ -968,7 +1013,7 @@ static SizeEstimate estimate_from_file_size(size_t total_bytes) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--verbose] [--debug] [--in-memory] [--tmpdir DIR]" << std::endl;
+        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [input2.osm.pbf ...] [--street-level N] [--admin-level N] [--max-vertices N] [--verbose] [--debug] [--in-memory] [--tmpdir DIR]" << std::endl;
         return 1;
     }
 
@@ -987,6 +1032,8 @@ int main(int argc, char* argv[]) {
             verbose = true;
         } else if (arg == "--in-memory") {
             in_memory = true;
+        } else if (arg == "--max-vertices" && i + 1 < argc) {
+            kMaxVertices = std::min(size_t(65535), size_t(std::atoi(argv[++i])));
         } else if (arg == "--tmpdir" && i + 1 < argc) {
             tmp_dir = argv[++i];
         } else {
@@ -1017,12 +1064,15 @@ int main(int argc, char* argv[]) {
     }
 
     BuildHandler handler;
+    auto total_start = Clock::now();
 
     for (const auto& input_file : input_files) {
         std::cerr << "Processing " << input_file << "..." << std::endl;
+        auto file_start = Clock::now();
 
         // --- Pass 1: collect relation members for multipolygon assembly ---
         std::cerr << "  Pass 1: scanning relations..." << std::endl;
+        auto pass1_start = Clock::now();
 
         osmium::area::Assembler::config_type assembler_config;
         assembler_config.ignore_invalid_locations = true;
@@ -1038,9 +1088,12 @@ int main(int argc, char* argv[]) {
             reader1.close();
             mp_manager.prepare_for_lookup();
         }
+        auto pass1_secs = Duration(Clock::now() - pass1_start).count();
+        std::cerr << "  Pass 1 done (" << format_duration(pass1_secs) << ")" << std::endl;
 
         // --- Pass 2: process all data ---
         std::cerr << "  Pass 2: processing nodes, ways, and areas..." << std::endl;
+        auto pass2_start = Clock::now();
 
         if (in_memory) {
             using index_type = osmium::index::map::SparseMemArray<
@@ -1075,9 +1128,13 @@ int main(int argc, char* argv[]) {
             close(fd);
             std::remove(tmp_path.c_str());
         }
+        auto pass2_secs = Duration(Clock::now() - pass2_start).count();
+        auto file_secs = Duration(Clock::now() - file_start).count();
+        std::cerr << "  Pass 2 done (" << format_duration(pass2_secs) << ", file total: " << format_duration(file_secs) << ")" << std::endl;
     }
 
-    std::cerr << "Done reading:" << std::endl;
+    auto read_secs = Duration(Clock::now() - total_start).count();
+    std::cerr << "Done reading (" << format_duration(read_secs) << "):" << std::endl;
     std::cerr << "  " << handler.way_count() << " street ways" << std::endl;
     std::cerr << "  " << addr_count_total << " address points ("
               << handler.building_addr_count() << " from buildings)" << std::endl;
@@ -1096,18 +1153,38 @@ int main(int argc, char* argv[]) {
         std::cerr << "  " << admin_invalid_nodes_skipped << " total invalid nodes skipped in boundaries" << std::endl;
     }
 
+    auto resolve_start = Clock::now();
     std::cerr << "Resolving interpolation endpoints..." << std::endl;
     resolve_interpolation_endpoints();
+    auto resolve_secs = Duration(Clock::now() - resolve_start).count();
 
+    auto dedup_start = Clock::now();
     std::cerr << "Deduplicating..." << std::endl;
+    std::cerr << "  cell_to_ways (" << cell_to_ways.size() << " cells)..." << std::endl;
     deduplicate(cell_to_ways);
+    std::cerr << "  cell_to_addrs (" << cell_to_addrs.size() << " cells)..." << std::endl;
     deduplicate(cell_to_addrs);
+    std::cerr << "  cell_to_interps (" << cell_to_interps.size() << " cells)..." << std::endl;
     deduplicate(cell_to_interps);
+    std::cerr << "  cell_to_admin (" << cell_to_admin.size() << " cells)..." << std::endl;
     deduplicate(cell_to_admin);
+    auto dedup_secs = Duration(Clock::now() - dedup_start).count();
+    std::cerr << "Dedup done (" << format_duration(dedup_secs) << ")" << std::endl;
 
+    auto write_start = Clock::now();
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
     write_index(output_dir);
+    auto write_secs = Duration(Clock::now() - write_start).count();
 
-    std::cerr << "Done." << std::endl;
+    auto total_secs = Duration(Clock::now() - total_start).count();
+    std::cerr << std::endl;
+    std::cerr << "Build complete in " << format_duration(total_secs) << std::endl;
+    std::cerr << "  Reading:       " << format_duration(read_secs) << std::endl;
+    std::cerr << "  Resolve:       " << format_duration(resolve_secs) << std::endl;
+    std::cerr << "  Dedup:         " << format_duration(dedup_secs) << std::endl;
+    std::cerr << "  Write:         " << format_duration(write_secs) << std::endl;
+    std::cerr << "  Throughput:    " << format_rate(handler.way_count(), read_secs) << " ways, "
+              << format_rate(addr_count_total, read_secs) << " addrs, "
+              << format_rate(admin_polygons.size(), read_secs) << " polygons" << std::endl;
     return 0;
 }
