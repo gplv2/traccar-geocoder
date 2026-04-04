@@ -5,7 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <set>
+#include <malloc.h>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -837,29 +837,64 @@ static void deduplicate(Map& cell_map) {
     }
 }
 
+// --- Memory stats from /proc/self/status ---
+
+struct MemStats {
+    size_t vm_rss_kb = 0;
+    size_t vm_swap_kb = 0;
+    size_t vm_size_kb = 0;
+};
+
+static MemStats get_mem_stats() {
+    MemStats stats;
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.compare(0, 6, "VmRSS:") == 0)
+            stats.vm_rss_kb = std::stoul(line.substr(6));
+        else if (line.compare(0, 7, "VmSwap:") == 0)
+            stats.vm_swap_kb = std::stoul(line.substr(7));
+        else if (line.compare(0, 7, "VmSize:") == 0)
+            stats.vm_size_kb = std::stoul(line.substr(7));
+    }
+    return stats;
+}
+
+static std::string format_mem(size_t kb) {
+    if (kb >= 1048576) return std::to_string(kb / 1048576) + "." + std::to_string((kb % 1048576) * 10 / 1048576) + " GB";
+    if (kb >= 1024) return std::to_string(kb / 1024) + " MB";
+    return std::to_string(kb) + " KB";
+}
+
+static void log_mem(const char* label) {
+    auto m = get_mem_stats();
+    std::cerr << "  [mem] " << label << ": RSS=" << format_mem(m.vm_rss_kb)
+              << " Swap=" << format_mem(m.vm_swap_kb)
+              << " VM=" << format_mem(m.vm_size_kb) << std::endl;
+}
+
 // --- Write cell index ---
 
 static const uint32_t NO_DATA = 0xFFFFFFFFu;
 
-// Write entries file and return offset map
-static std::unordered_map<uint64_t, uint32_t> write_entries(
+// Write entries file and fill position-indexed offset vector
+static void write_entries(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
-    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
+    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
+    std::vector<uint32_t>& offsets
 ) {
-    std::unordered_map<uint64_t, uint32_t> offsets;
     std::ofstream f(path, std::ios::binary);
     uint32_t current = 0;
-    for (uint64_t cell_id : sorted_cells) {
-        auto it = cell_map.find(cell_id);
+    for (size_t i = 0; i < sorted_cells.size(); i++) {
+        auto it = cell_map.find(sorted_cells[i]);
         if (it == cell_map.end()) continue;
-        offsets[cell_id] = current;
+        offsets[i] = current;
         uint16_t count = static_cast<uint16_t>(std::min(it->second.size(), size_t(65535)));
         f.write(reinterpret_cast<const char*>(&count), sizeof(count));
         f.write(reinterpret_cast<const char*>(it->second.data()), it->second.size() * sizeof(uint32_t));
         current += sizeof(uint16_t) + it->second.size() * sizeof(uint32_t);
     }
-    return offsets;
 }
 
 static void write_cell_index(
@@ -894,96 +929,157 @@ static void write_cell_index(
 // --- Write all index files ---
 
 static void write_index(const std::string& output_dir) {
-    // Merged geo cell index for streets, addresses, and interpolation
-    std::cerr << "  Merging geo cell keys..." << std::endl;
-    std::set<uint64_t> all_geo_cells;
-    for (const auto& [id, _] : cell_to_ways) all_geo_cells.insert(id);
-    for (const auto& [id, _] : cell_to_addrs) all_geo_cells.insert(id);
-    for (const auto& [id, _] : cell_to_interps) all_geo_cells.insert(id);
-    std::vector<uint64_t> sorted_geo_cells(all_geo_cells.begin(), all_geo_cells.end());
-    std::cerr << "  " << sorted_geo_cells.size() << " geo cells merged" << std::endl;
+    auto phase_start = std::chrono::steady_clock::now();
+    auto phase_timer = [&]() {
+        auto now = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(now - phase_start).count();
+        phase_start = now;
+        return secs;
+    };
 
-    std::cerr << "  Writing street_entries.bin..." << std::endl;
-    auto street_offsets = write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, cell_to_ways);
-    std::cerr << "  Writing addr_entries.bin..." << std::endl;
-    auto addr_offsets = write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, cell_to_addrs);
-    std::cerr << "  Writing interp_entries.bin..." << std::endl;
-    auto interp_offsets = write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, cell_to_interps);
+    // --- Phase 1: Shrink vectors to reclaim over-reserved capacity ---
+    log_mem("write start");
+    std::cerr << "  Shrinking vectors to fit..." << std::endl;
+    ways.shrink_to_fit();
+    street_nodes.shrink_to_fit();
+    addr_points.shrink_to_fit();
+    admin_polygons.shrink_to_fit();
+    admin_vertices.shrink_to_fit();
+    interp_ways.shrink_to_fit();
+    interp_nodes.shrink_to_fit();
+    malloc_trim(0);
+    log_mem("after shrink_to_fit");
 
-    {
-        std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
-        for (uint64_t cell_id : sorted_geo_cells) {
-            f.write(reinterpret_cast<const char*>(&cell_id), sizeof(cell_id));
-            auto write_offset = [&](const std::unordered_map<uint64_t, uint32_t>& offsets) {
-                auto it = offsets.find(cell_id);
-                uint32_t offset = (it != offsets.end()) ? it->second : NO_DATA;
-                f.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
-            };
-            write_offset(street_offsets);
-            write_offset(addr_offsets);
-            write_offset(interp_offsets);
-        }
-    }
-
-    std::cerr << "  Writing geo_cells.bin..." << std::endl;
-    std::cerr << "  geo index: " << sorted_geo_cells.size() << " cells ("
-              << ways.size() << " ways, "
-              << addr_points.size() << " addrs, "
-              << interp_ways.size() << " interps)" << std::endl;
-
-    std::cerr << "  Writing admin_cells.bin + admin_entries.bin..." << std::endl;
-    write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", cell_to_admin);
-    std::cerr << "  admin index: " << cell_to_admin.size() << " cells, " << admin_polygons.size() << " polygons" << std::endl;
-
+    // --- Phase 2: Write data files first, free each vector after ---
     std::cerr << "  Writing street_ways.bin (" << ways.size() << " ways)..." << std::endl;
     {
         std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(ways.data()), ways.size() * sizeof(WayHeader));
     }
+    { decltype(ways){}.swap(ways); }
 
     std::cerr << "  Writing street_nodes.bin (" << street_nodes.size() << " nodes)..." << std::endl;
     {
         std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(street_nodes.data()), street_nodes.size() * sizeof(NodeCoord));
     }
+    { decltype(street_nodes){}.swap(street_nodes); }
 
     std::cerr << "  Writing addr_points.bin (" << addr_points.size() << " points)..." << std::endl;
     {
         std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(addr_points.data()), addr_points.size() * sizeof(AddrPoint));
     }
+    { decltype(addr_points){}.swap(addr_points); }
 
     std::cerr << "  Writing interp_ways.bin (" << interp_ways.size() << " ways)..." << std::endl;
     {
         std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(interp_ways.data()), interp_ways.size() * sizeof(InterpWay));
     }
+    { decltype(interp_ways){}.swap(interp_ways); }
 
     std::cerr << "  Writing interp_nodes.bin (" << interp_nodes.size() << " nodes)..." << std::endl;
     {
         std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(interp_nodes.data()), interp_nodes.size() * sizeof(NodeCoord));
     }
+    { decltype(interp_nodes){}.swap(interp_nodes); }
 
     std::cerr << "  Writing admin_polygons.bin (" << admin_polygons.size() << " polygons)..." << std::endl;
     {
         std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(admin_polygons.data()), admin_polygons.size() * sizeof(AdminPolygon));
     }
+    { decltype(admin_polygons){}.swap(admin_polygons); }
 
     std::cerr << "  Writing admin_vertices.bin (" << admin_vertices.size() << " vertices)..." << std::endl;
     {
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(admin_vertices.data()), admin_vertices.size() * sizeof(NodeCoord));
     }
+    { decltype(admin_vertices){}.swap(admin_vertices); }
 
     std::cerr << "  Writing strings.bin (" << strings.data().size() / 1024 / 1024 << " MB)..." << std::endl;
     {
         std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
         f.write(strings.data().data(), strings.data().size());
     }
+    strings = StringPool{};
 
+    malloc_trim(0);
+    log_mem("data files freed");
+    double data_secs = phase_timer();
+    std::cerr << "  Data files written (" << std::fixed << std::setprecision(1) << data_secs << "s)" << std::endl;
 
+    // --- Phase 3: Merge geo cell keys (vector+sort+unique, not std::set) ---
+    std::cerr << "  Merging geo cell keys..." << std::endl;
+    std::vector<uint64_t> sorted_geo_cells;
+    sorted_geo_cells.reserve(cell_to_ways.size() + cell_to_addrs.size() + cell_to_interps.size());
+    for (const auto& [id, _] : cell_to_ways) sorted_geo_cells.push_back(id);
+    for (const auto& [id, _] : cell_to_addrs) sorted_geo_cells.push_back(id);
+    for (const auto& [id, _] : cell_to_interps) sorted_geo_cells.push_back(id);
+    std::sort(sorted_geo_cells.begin(), sorted_geo_cells.end());
+    sorted_geo_cells.erase(std::unique(sorted_geo_cells.begin(), sorted_geo_cells.end()), sorted_geo_cells.end());
+    sorted_geo_cells.shrink_to_fit();
+    log_mem("geo cells sorted");
+    double merge_secs = phase_timer();
+    std::cerr << "  " << sorted_geo_cells.size() << " geo cells merged (" << std::fixed << std::setprecision(1) << merge_secs << "s)" << std::endl;
+
+    // --- Phase 4: Write entry files, free each cell map after ---
+    std::vector<uint32_t> street_offsets(sorted_geo_cells.size(), NO_DATA);
+    std::vector<uint32_t> addr_offsets(sorted_geo_cells.size(), NO_DATA);
+    std::vector<uint32_t> interp_offsets(sorted_geo_cells.size(), NO_DATA);
+
+    std::cerr << "  Writing street_entries.bin..." << std::endl;
+    write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, cell_to_ways, street_offsets);
+    { decltype(cell_to_ways){}.swap(cell_to_ways); }
+    malloc_trim(0);
+    log_mem("cell_to_ways freed");
+
+    std::cerr << "  Writing addr_entries.bin..." << std::endl;
+    write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, cell_to_addrs, addr_offsets);
+    { decltype(cell_to_addrs){}.swap(cell_to_addrs); }
+    malloc_trim(0);
+    log_mem("cell_to_addrs freed");
+
+    std::cerr << "  Writing interp_entries.bin..." << std::endl;
+    write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, cell_to_interps, interp_offsets);
+    { decltype(cell_to_interps){}.swap(cell_to_interps); }
+    malloc_trim(0);
+    log_mem("cell_to_interps freed");
+
+    double entries_secs = phase_timer();
+    std::cerr << "  Entry files written (" << std::fixed << std::setprecision(1) << entries_secs << "s)" << std::endl;
+
+    // --- Phase 5: Write geo_cells.bin (fully sequential, no hash lookups) ---
+    std::cerr << "  Writing geo_cells.bin (" << sorted_geo_cells.size() << " cells)..." << std::endl;
+    {
+        std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
+        for (size_t i = 0; i < sorted_geo_cells.size(); i++) {
+            f.write(reinterpret_cast<const char*>(&sorted_geo_cells[i]), sizeof(uint64_t));
+            f.write(reinterpret_cast<const char*>(&street_offsets[i]), sizeof(uint32_t));
+            f.write(reinterpret_cast<const char*>(&addr_offsets[i]), sizeof(uint32_t));
+            f.write(reinterpret_cast<const char*>(&interp_offsets[i]), sizeof(uint32_t));
+        }
+    }
+    { decltype(street_offsets){}.swap(street_offsets); }
+    { decltype(addr_offsets){}.swap(addr_offsets); }
+    { decltype(interp_offsets){}.swap(interp_offsets); }
+    { decltype(sorted_geo_cells){}.swap(sorted_geo_cells); }
+    malloc_trim(0);
+    log_mem("geo_cells + offsets freed");
+    double geo_secs = phase_timer();
+    std::cerr << "  geo_cells.bin written (" << std::fixed << std::setprecision(1) << geo_secs << "s)" << std::endl;
+
+    // --- Phase 6: Write admin cell index ---
+    std::cerr << "  Writing admin_cells.bin + admin_entries.bin (" << cell_to_admin.size() << " cells)..." << std::endl;
+    write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", cell_to_admin);
+    { decltype(cell_to_admin){}.swap(cell_to_admin); }
+    malloc_trim(0);
+    log_mem("all freed");
+    double admin_secs = phase_timer();
+    std::cerr << "  Admin index written (" << std::fixed << std::setprecision(1) << admin_secs << "s)" << std::endl;
 }
 
 // --- Capacity estimation from PBF file size ---
@@ -998,14 +1094,15 @@ struct SizeEstimate {
 
 static SizeEstimate estimate_from_file_size(size_t total_bytes) {
     double gb = total_bytes / (1024.0 * 1024.0 * 1024.0);
-    // Conservative per-GB ratios from Italy/France/Benelux testing
-    // with 20% headroom to avoid reallocations
+    // Per-GB ratios calibrated from Europe (32 GB) and planet (86 GB) builds.
+    // Over-reservation is OK — shrink_to_fit() at write time reclaims it.
+    // Under-reservation causes expensive reallocations, so use max observed + headroom.
     return {
-        static_cast<size_t>(gb * 900000),    // ways (~870K/GB observed)
-        static_cast<size_t>(gb * 7500000),   // addr_points (highly variable, use high estimate)
-        static_cast<size_t>(gb * 4500000),   // street_nodes (~3-5 nodes per way)
+        static_cast<size_t>(gb * 900000),    // ways (~870K/GB Europe, ~557K/GB planet)
+        static_cast<size_t>(gb * 3000000),   // addr_points (~2.7M/GB Europe, ~1.9M/GB planet)
+        static_cast<size_t>(gb * 6500000),   // street_nodes (~5.9M/GB planet, ~4.5M/GB Europe)
         static_cast<size_t>(gb * 15000),     // admin_polygons
-        static_cast<size_t>(gb * 500000),    // admin_vertices
+        static_cast<size_t>(gb * 5000000),   // admin_vertices (~4.2M/GB planet)
     };
 }
 
@@ -1171,6 +1268,8 @@ int main(int argc, char* argv[]) {
     auto dedup_secs = Duration(Clock::now() - dedup_start).count();
     std::cerr << "Dedup done (" << format_duration(dedup_secs) << ")" << std::endl;
 
+    size_t admin_polygon_count = admin_polygons.size();
+
     auto write_start = Clock::now();
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
     write_index(output_dir);
@@ -1185,6 +1284,6 @@ int main(int argc, char* argv[]) {
     std::cerr << "  Write:         " << format_duration(write_secs) << std::endl;
     std::cerr << "  Throughput:    " << format_rate(handler.way_count(), read_secs) << " ways, "
               << format_rate(addr_count_total, read_secs) << " addrs, "
-              << format_rate(admin_polygons.size(), read_secs) << " polygons" << std::endl;
+              << format_rate(admin_polygon_count, read_secs) << " polygons" << std::endl;
     return 0;
 }
