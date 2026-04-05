@@ -99,6 +99,37 @@ private:
     std::vector<char> data_;
 };
 
+// --- Flat cell entry for sorted pair vectors ---
+
+struct CellEntry {
+    uint64_t cell_id;
+    uint32_t item_id;
+} __attribute__((packed));
+
+static bool cell_entry_less(const CellEntry& a, const CellEntry& b) {
+    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+}
+
+static bool cell_entry_equal(const CellEntry& a, const CellEntry& b) {
+    return a.cell_id == b.cell_id && a.item_id == b.item_id;
+}
+
+static void sort_and_dedup(std::vector<CellEntry>& pairs) {
+    std::sort(pairs.begin(), pairs.end(), cell_entry_less);
+    pairs.erase(std::unique(pairs.begin(), pairs.end(), cell_entry_equal), pairs.end());
+    pairs.shrink_to_fit();
+}
+
+static size_t count_unique_cells(const std::vector<CellEntry>& pairs) {
+    size_t count = 0;
+    for (size_t i = 0; i < pairs.size(); ) {
+        count++;
+        uint64_t cur = pairs[i].cell_id;
+        while (i < pairs.size() && pairs[i].cell_id == cur) i++;
+    }
+    return count;
+}
+
 // --- Collected data ---
 
 static StringPool strings;
@@ -106,21 +137,21 @@ static StringPool strings;
 // Streets
 static std::vector<WayHeader> ways;
 static std::vector<NodeCoord> street_nodes;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
+static std::vector<CellEntry> way_pairs;
 
 // Addresses
 static std::vector<AddrPoint> addr_points;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_addrs;
+static std::vector<CellEntry> addr_pairs;
 
 // Interpolation
 static std::vector<InterpWay> interp_ways;
 static std::vector<NodeCoord> interp_nodes;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_interps;
+static std::vector<CellEntry> interp_pairs;
 
 // Admin boundaries
 static std::vector<AdminPolygon> admin_polygons;
 static std::vector<NodeCoord> admin_vertices;
-static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
+static std::vector<CellEntry> admin_pairs;
 
 // --- S2 helpers ---
 
@@ -479,7 +510,7 @@ static void add_addr_point(double lat, double lng, const char* housenumber, cons
     });
 
     S2CellId cell = point_to_cell(lat, lng);
-    cell_to_addrs[cell.id()].push_back(addr_id);
+    addr_pairs.push_back({cell.id(), addr_id});
 
     addr_count_total++;
     if (addr_count_total % 1000000 == 0) {
@@ -532,7 +563,7 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
     auto cell_ids = cover_polygon(simplified, name, admin_level);
     for (const auto& [cell_id, is_interior] : cell_ids) {
         uint32_t entry = is_interior ? (poly_id | INTERIOR_FLAG) : poly_id;
-        cell_to_admin[cell_id.id()].push_back(entry);
+        admin_pairs.push_back({cell_id.id(), entry});
     }
 }
 
@@ -717,7 +748,7 @@ private:
             }
         }
         for (uint64_t cell_id : interp_cells) {
-            cell_to_interps[cell_id].push_back(interp_id);
+            interp_pairs.push_back({cell_id, interp_id});
         }
 
         interp_count_++;
@@ -760,7 +791,7 @@ private:
             }
         }
         for (uint64_t cell_id : way_cells) {
-            cell_to_ways[cell_id].push_back(way_id);
+            way_pairs.push_back({cell_id, way_id});
         }
 
         way_count_++;
@@ -827,15 +858,8 @@ static void resolve_interpolation_endpoints() {
               << " interpolation ways" << std::endl;
 }
 
-// --- Deduplicate IDs per cell ---
-
-template<typename Map>
-static void deduplicate(Map& cell_map) {
-    for (auto& [cell_id, ids] : cell_map) {
-        std::sort(ids.begin(), ids.end());
-        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-    }
-}
+// --- Deduplicate: sort flat pair vectors and remove duplicate (cell_id, item_id) pairs ---
+// (replaces per-cell hash map iteration with one cache-friendly sort)
 
 // --- Memory stats from /proc/self/status ---
 
@@ -877,51 +901,64 @@ static void log_mem(const char* label) {
 
 static const uint32_t NO_DATA = 0xFFFFFFFFu;
 
-// Write entries file and fill position-indexed offset vector
+// Write entries file using merge scan over sorted cell list and sorted pairs
 static void write_entries(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
-    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
+    const std::vector<CellEntry>& pairs,
     std::vector<uint32_t>& offsets
 ) {
     std::ofstream f(path, std::ios::binary);
     uint32_t current = 0;
+    size_t j = 0;
     for (size_t i = 0; i < sorted_cells.size(); i++) {
-        auto it = cell_map.find(sorted_cells[i]);
-        if (it == cell_map.end()) continue;
+        while (j < pairs.size() && pairs[j].cell_id < sorted_cells[i]) j++;
+        if (j >= pairs.size() || pairs[j].cell_id != sorted_cells[i]) continue;
+
         offsets[i] = current;
-        uint16_t count = static_cast<uint16_t>(std::min(it->second.size(), size_t(65535)));
+        size_t start = j;
+        while (j < pairs.size() && pairs[j].cell_id == sorted_cells[i]) j++;
+        uint16_t count = static_cast<uint16_t>(std::min(j - start, size_t(65535)));
         f.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        f.write(reinterpret_cast<const char*>(it->second.data()), it->second.size() * sizeof(uint32_t));
-        current += sizeof(uint16_t) + it->second.size() * sizeof(uint32_t);
+        for (size_t k = start; k < start + count; k++) {
+            f.write(reinterpret_cast<const char*>(&pairs[k].item_id), sizeof(uint32_t));
+        }
+        current += sizeof(uint16_t) + count * sizeof(uint32_t);
     }
 }
 
 static void write_cell_index(
     const std::string& cells_path,
     const std::string& entries_path,
-    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
+    const std::vector<CellEntry>& pairs
 ) {
-    std::vector<std::pair<uint64_t, std::vector<uint32_t>>> sorted(
-        cell_map.begin(), cell_map.end());
-    std::sort(sorted.begin(), sorted.end());
-
+    // First pass: compute cell boundaries and offsets for cells.bin
     {
         std::ofstream f(cells_path, std::ios::binary);
         uint32_t current_offset = 0;
-        for (const auto& [cell_id, ids] : sorted) {
+        for (size_t i = 0; i < pairs.size(); ) {
+            uint64_t cell_id = pairs[i].cell_id;
+            size_t start = i;
+            while (i < pairs.size() && pairs[i].cell_id == cell_id) i++;
+            size_t count = std::min(i - start, size_t(65535));
             f.write(reinterpret_cast<const char*>(&cell_id), sizeof(cell_id));
             f.write(reinterpret_cast<const char*>(&current_offset), sizeof(current_offset));
-            current_offset += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
+            current_offset += sizeof(uint16_t) + count * sizeof(uint32_t);
         }
     }
 
+    // Second pass: write entries.bin
     {
         std::ofstream f(entries_path, std::ios::binary);
-        for (const auto& [cell_id, ids] : sorted) {
-            uint16_t count = static_cast<uint16_t>(std::min(ids.size(), size_t(65535)));
+        for (size_t i = 0; i < pairs.size(); ) {
+            uint64_t cell_id = pairs[i].cell_id;
+            size_t start = i;
+            while (i < pairs.size() && pairs[i].cell_id == cell_id) i++;
+            uint16_t count = static_cast<uint16_t>(std::min(i - start, size_t(65535)));
             f.write(reinterpret_cast<const char*>(&count), sizeof(count));
-            f.write(reinterpret_cast<const char*>(ids.data()), ids.size() * sizeof(uint32_t));
+            for (size_t k = start; k < start + count; k++) {
+                f.write(reinterpret_cast<const char*>(&pairs[k].item_id), sizeof(uint32_t));
+            }
         }
     }
 }
@@ -1012,13 +1049,30 @@ static void write_index(const std::string& output_dir) {
     double data_secs = phase_timer();
     std::cerr << "  Data files written (" << std::fixed << std::setprecision(1) << data_secs << "s)" << std::endl;
 
-    // --- Phase 3: Merge geo cell keys (vector+sort+unique, not std::set) ---
+    // --- Phase 3: Extract unique cell IDs from sorted pair vectors ---
     std::cerr << "  Merging geo cell keys..." << std::endl;
+    auto extract_unique_cells = [](const std::vector<CellEntry>& pairs) {
+        std::vector<uint64_t> cells;
+        for (size_t i = 0; i < pairs.size(); ) {
+            cells.push_back(pairs[i].cell_id);
+            uint64_t cur = pairs[i].cell_id;
+            while (i < pairs.size() && pairs[i].cell_id == cur) i++;
+        }
+        return cells;
+    };
+    auto way_cells = extract_unique_cells(way_pairs);
+    auto addr_cells = extract_unique_cells(addr_pairs);
+    auto interp_cells = extract_unique_cells(interp_pairs);
+
+    // Merge 3 sorted cell ID vectors
     std::vector<uint64_t> sorted_geo_cells;
-    sorted_geo_cells.reserve(cell_to_ways.size() + cell_to_addrs.size() + cell_to_interps.size());
-    for (const auto& [id, _] : cell_to_ways) sorted_geo_cells.push_back(id);
-    for (const auto& [id, _] : cell_to_addrs) sorted_geo_cells.push_back(id);
-    for (const auto& [id, _] : cell_to_interps) sorted_geo_cells.push_back(id);
+    sorted_geo_cells.reserve(way_cells.size() + addr_cells.size() + interp_cells.size());
+    sorted_geo_cells.insert(sorted_geo_cells.end(), way_cells.begin(), way_cells.end());
+    sorted_geo_cells.insert(sorted_geo_cells.end(), addr_cells.begin(), addr_cells.end());
+    sorted_geo_cells.insert(sorted_geo_cells.end(), interp_cells.begin(), interp_cells.end());
+    { decltype(way_cells){}.swap(way_cells); }
+    { decltype(addr_cells){}.swap(addr_cells); }
+    { decltype(interp_cells){}.swap(interp_cells); }
     std::sort(sorted_geo_cells.begin(), sorted_geo_cells.end());
     sorted_geo_cells.erase(std::unique(sorted_geo_cells.begin(), sorted_geo_cells.end()), sorted_geo_cells.end());
     sorted_geo_cells.shrink_to_fit();
@@ -1026,28 +1080,28 @@ static void write_index(const std::string& output_dir) {
     double merge_secs = phase_timer();
     std::cerr << "  " << sorted_geo_cells.size() << " geo cells merged (" << std::fixed << std::setprecision(1) << merge_secs << "s)" << std::endl;
 
-    // --- Phase 4: Write entry files, free each cell map after ---
+    // --- Phase 4: Write entry files via merge scan, free each pair vector after ---
     std::vector<uint32_t> street_offsets(sorted_geo_cells.size(), NO_DATA);
     std::vector<uint32_t> addr_offsets(sorted_geo_cells.size(), NO_DATA);
     std::vector<uint32_t> interp_offsets(sorted_geo_cells.size(), NO_DATA);
 
     std::cerr << "  Writing street_entries.bin..." << std::endl;
-    write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, cell_to_ways, street_offsets);
-    { decltype(cell_to_ways){}.swap(cell_to_ways); }
+    write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, way_pairs, street_offsets);
+    { decltype(way_pairs){}.swap(way_pairs); }
     malloc_trim(0);
-    log_mem("cell_to_ways freed");
+    log_mem("way_pairs freed");
 
     std::cerr << "  Writing addr_entries.bin..." << std::endl;
-    write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, cell_to_addrs, addr_offsets);
-    { decltype(cell_to_addrs){}.swap(cell_to_addrs); }
+    write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, addr_pairs, addr_offsets);
+    { decltype(addr_pairs){}.swap(addr_pairs); }
     malloc_trim(0);
-    log_mem("cell_to_addrs freed");
+    log_mem("addr_pairs freed");
 
     std::cerr << "  Writing interp_entries.bin..." << std::endl;
-    write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, cell_to_interps, interp_offsets);
-    { decltype(cell_to_interps){}.swap(cell_to_interps); }
+    write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, interp_pairs, interp_offsets);
+    { decltype(interp_pairs){}.swap(interp_pairs); }
     malloc_trim(0);
-    log_mem("cell_to_interps freed");
+    log_mem("interp_pairs freed");
 
     double entries_secs = phase_timer();
     std::cerr << "  Entry files written (" << std::fixed << std::setprecision(1) << entries_secs << "s)" << std::endl;
@@ -1073,9 +1127,10 @@ static void write_index(const std::string& output_dir) {
     std::cerr << "  geo_cells.bin written (" << std::fixed << std::setprecision(1) << geo_secs << "s)" << std::endl;
 
     // --- Phase 6: Write admin cell index ---
-    std::cerr << "  Writing admin_cells.bin + admin_entries.bin (" << cell_to_admin.size() << " cells)..." << std::endl;
-    write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", cell_to_admin);
-    { decltype(cell_to_admin){}.swap(cell_to_admin); }
+    size_t admin_cell_count = count_unique_cells(admin_pairs);
+    std::cerr << "  Writing admin_cells.bin + admin_entries.bin (" << admin_cell_count << " cells)..." << std::endl;
+    write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", admin_pairs);
+    { decltype(admin_pairs){}.swap(admin_pairs); }
     malloc_trim(0);
     log_mem("all freed");
     double admin_secs = phase_timer();
@@ -1090,6 +1145,9 @@ struct SizeEstimate {
     size_t street_nodes;
     size_t admin_polygons;
     size_t admin_vertices;
+    size_t way_pairs;
+    size_t addr_pairs;
+    size_t admin_pairs;
 };
 
 static SizeEstimate estimate_from_file_size(size_t total_bytes) {
@@ -1103,6 +1161,9 @@ static SizeEstimate estimate_from_file_size(size_t total_bytes) {
         static_cast<size_t>(gb * 6500000),   // street_nodes (~5.9M/GB planet, ~4.5M/GB Europe)
         static_cast<size_t>(gb * 15000),     // admin_polygons
         static_cast<size_t>(gb * 5000000),   // admin_vertices (~4.2M/GB planet)
+        static_cast<size_t>(gb * 9000000),   // way_pairs (~900K ways × 10 cells/way)
+        static_cast<size_t>(gb * 3000000),   // addr_pairs (1 cell per addr, same as addr_points)
+        static_cast<size_t>(gb * 100000),    // admin_pairs (~15K polys × ~7 cells/poly)
     };
 }
 
@@ -1153,6 +1214,9 @@ int main(int argc, char* argv[]) {
         street_nodes.reserve(est.street_nodes);
         admin_polygons.reserve(est.admin_polygons);
         admin_vertices.reserve(est.admin_vertices);
+        way_pairs.reserve(est.way_pairs);
+        addr_pairs.reserve(est.addr_pairs);
+        admin_pairs.reserve(est.admin_pairs);
         if (verbose) {
             double gb = total_pbf_bytes / (1024.0 * 1024.0 * 1024.0);
             std::cerr << "Pre-allocated for " << std::fixed << std::setprecision(1)
@@ -1256,17 +1320,23 @@ int main(int argc, char* argv[]) {
     auto resolve_secs = Duration(Clock::now() - resolve_start).count();
 
     auto dedup_start = Clock::now();
-    std::cerr << "Deduplicating..." << std::endl;
-    std::cerr << "  cell_to_ways (" << cell_to_ways.size() << " cells)..." << std::endl;
-    deduplicate(cell_to_ways);
-    std::cerr << "  cell_to_addrs (" << cell_to_addrs.size() << " cells)..." << std::endl;
-    deduplicate(cell_to_addrs);
-    std::cerr << "  cell_to_interps (" << cell_to_interps.size() << " cells)..." << std::endl;
-    deduplicate(cell_to_interps);
-    std::cerr << "  cell_to_admin (" << cell_to_admin.size() << " cells)..." << std::endl;
-    deduplicate(cell_to_admin);
+    std::cerr << "Sorting and deduplicating flat pair vectors..." << std::endl;
+    log_mem("before sort+dedup");
+    std::cerr << "  way_pairs (" << way_pairs.size() << " pairs)..." << std::endl;
+    sort_and_dedup(way_pairs);
+    std::cerr << "  way_pairs deduped to " << way_pairs.size() << " (" << count_unique_cells(way_pairs) << " cells)" << std::endl;
+    std::cerr << "  addr_pairs (" << addr_pairs.size() << " pairs)..." << std::endl;
+    sort_and_dedup(addr_pairs);
+    std::cerr << "  addr_pairs deduped to " << addr_pairs.size() << " (" << count_unique_cells(addr_pairs) << " cells)" << std::endl;
+    std::cerr << "  interp_pairs (" << interp_pairs.size() << " pairs)..." << std::endl;
+    sort_and_dedup(interp_pairs);
+    std::cerr << "  interp_pairs deduped to " << interp_pairs.size() << " (" << count_unique_cells(interp_pairs) << " cells)" << std::endl;
+    std::cerr << "  admin_pairs (" << admin_pairs.size() << " pairs)..." << std::endl;
+    sort_and_dedup(admin_pairs);
+    std::cerr << "  admin_pairs deduped to " << admin_pairs.size() << " (" << count_unique_cells(admin_pairs) << " cells)" << std::endl;
+    log_mem("after sort+dedup");
     auto dedup_secs = Duration(Clock::now() - dedup_start).count();
-    std::cerr << "Dedup done (" << format_duration(dedup_secs) << ")" << std::endl;
+    std::cerr << "Sort+dedup done (" << format_duration(dedup_secs) << ")" << std::endl;
 
     size_t admin_polygon_count = admin_polygons.size();
 
