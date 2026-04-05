@@ -801,6 +801,140 @@ private:
     }
 };
 
+// --- Pass 1.5: Node filtering for memory-efficient builds ---
+
+// Bitmap storing 1 bit per possible node ID. Dynamic resizing.
+class NodeBitmap {
+    std::vector<uint64_t> bits_;
+public:
+    void set(uint64_t id) {
+        size_t idx = id / 64;
+        if (idx >= bits_.size()) bits_.resize(idx + 65536, 0);
+        bits_[idx] |= (1ULL << (id % 64));
+    }
+    bool test(uint64_t id) const {
+        size_t idx = id / 64;
+        if (idx >= bits_.size()) return false;
+        return (bits_[idx] >> (id % 64)) & 1ULL;
+    }
+    size_t count() const {
+        size_t n = 0;
+        for (auto w : bits_) n += __builtin_popcountll(w);
+        return n;
+    }
+    size_t memory_mb() const { return bits_.size() * sizeof(uint64_t) / (1024 * 1024); }
+    void clear() { std::vector<uint64_t>{}.swap(bits_); }
+};
+
+// Collects way IDs that are members of admin/postal boundary relations (runs in Pass 1)
+class RelationWayCollector : public osmium::handler::Handler {
+    std::unordered_set<uint64_t> admin_way_ids_;
+public:
+    void relation(const osmium::Relation& relation) {
+        const char* boundary = relation.tags()["boundary"];
+        if (!boundary) return;
+        bool is_admin = (std::strcmp(boundary, "administrative") == 0);
+        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
+        if (!is_admin && !is_postal) return;
+        if (is_admin) {
+            const char* level = relation.tags()["admin_level"];
+            if (!level) return;
+            int l = std::atoi(level);
+            if (l < 2 || l > 10) return;
+        }
+        for (const auto& member : relation.members()) {
+            if (member.type() == osmium::item_type::way)
+                admin_way_ids_.insert(member.positive_ref());
+        }
+    }
+    const std::unordered_set<uint64_t>& admin_way_ids() const { return admin_way_ids_; }
+    size_t size() const { return admin_way_ids_.size(); }
+};
+
+// Scans ways to collect needed node IDs into a bitmap (runs in Pass 1.5)
+class WayNodeCollector : public osmium::handler::Handler {
+    NodeBitmap& bitmap_;
+    const std::unordered_set<uint64_t>& admin_way_ids_;
+    uint64_t collected_ways_ = 0;
+public:
+    WayNodeCollector(NodeBitmap& bitmap, const std::unordered_set<uint64_t>& admin_way_ids)
+        : bitmap_(bitmap), admin_way_ids_(admin_way_ids) {}
+
+    void way(const osmium::Way& way) {
+        bool needed = false;
+        // Admin/postal boundary member ways (from relations)
+        if (admin_way_ids_.count(way.positive_id())) needed = true;
+        // Simple closed way boundaries (not part of a relation)
+        if (!needed) {
+            const char* boundary = way.tags()["boundary"];
+            if (boundary && (std::strcmp(boundary, "administrative") == 0 ||
+                             std::strcmp(boundary, "postal_code") == 0)) needed = true;
+        }
+        // Building addresses (way with addr:housenumber + addr:street)
+        if (!needed && way.tags()["addr:housenumber"] && way.tags()["addr:street"]) needed = true;
+        // Address interpolation
+        if (!needed && way.tags()["addr:interpolation"]) needed = true;
+        // Named highways
+        if (!needed) {
+            const char* hw = way.tags()["highway"];
+            if (hw && is_included_highway(hw) && way.tags()["name"]) needed = true;
+        }
+        if (!needed) return;
+        for (const auto& nr : way.nodes())
+            bitmap_.set(nr.positive_ref());
+        collected_ways_++;
+    }
+    uint64_t collected_ways() const { return collected_ways_; }
+};
+
+// Filtered version of osmium::handler::NodeLocationsForWays.
+// Only stores locations for nodes present in the bitmap.
+template <typename TIndex>
+class FilteredNodeLocationsForWays : public osmium::handler::Handler {
+    TIndex& m_storage;
+    const NodeBitmap& m_bitmap;
+    osmium::unsigned_object_id_type m_last_id = 0;
+    bool m_ignore_errors = false;
+    bool m_must_sort = false;
+    uint64_t m_stored = 0;
+    uint64_t m_skipped = 0;
+
+public:
+    FilteredNodeLocationsForWays(TIndex& storage, const NodeBitmap& bitmap)
+        : m_storage(storage), m_bitmap(bitmap) {}
+
+    void ignore_errors() { m_ignore_errors = true; }
+    uint64_t stored() const { return m_stored; }
+    uint64_t skipped() const { return m_skipped; }
+
+    void node(const osmium::Node& node) {
+        const auto id = node.positive_id();
+        if (id < m_last_id) m_must_sort = true;
+        m_last_id = id;
+        if (!m_bitmap.test(id)) { m_skipped++; return; }
+        m_storage.set(static_cast<osmium::unsigned_object_id_type>(
+            node.id() >= 0 ? node.id() : -node.id()), node.location());
+        m_stored++;
+    }
+
+    void way(osmium::Way& way) {
+        if (m_must_sort) {
+            m_storage.sort();
+            m_must_sort = false;
+            m_last_id = std::numeric_limits<osmium::unsigned_object_id_type>::max();
+        }
+        bool error = false;
+        for (auto& nr : way.nodes()) {
+            const auto id = nr.ref();
+            nr.set_location(m_storage.get_noexcept(
+                static_cast<osmium::unsigned_object_id_type>(id >= 0 ? id : -id)));
+            if (!nr.location()) error = true;
+        }
+        if (!m_ignore_errors && error)
+            throw osmium::not_found{"location not found in filtered node location index"};
+    }
+};
+
 // --- Resolve interpolation way endpoint house numbers ---
 
 static void resolve_interpolation_endpoints() {
@@ -1242,27 +1376,46 @@ int main(int argc, char* argv[]) {
             assembler_config.problem_reporter = &problem_reporter;
         }
         osmium::area::MultipolygonManager<osmium::area::Assembler> mp_manager{assembler_config};
+        RelationWayCollector way_collector;
 
         {
             osmium::io::Reader reader1{input_file, osmium::osm_entity_bits::relation, osmium::io::read_meta::no};
-            osmium::apply(reader1, mp_manager);
+            osmium::apply(reader1, mp_manager, way_collector);
             reader1.close();
             mp_manager.prepare_for_lookup();
         }
         auto pass1_secs = Duration(Clock::now() - pass1_start).count();
-        std::cerr << "  Pass 1 done (" << format_duration(pass1_secs) << ")" << std::endl;
+        std::cerr << "  Pass 1 done (" << format_duration(pass1_secs)
+                  << ", " << way_collector.size() << " admin/postal way members)" << std::endl;
 
-        // --- Pass 2: process all data ---
+        // --- Pass 1.5: scan ways to collect needed node IDs ---
+        std::cerr << "  Pass 1.5: scanning ways for needed node IDs..." << std::endl;
+        auto pass15_start = Clock::now();
+        NodeBitmap needed_nodes;
+        {
+            WayNodeCollector node_collector{needed_nodes, way_collector.admin_way_ids()};
+            osmium::io::Reader reader15{input_file, osmium::osm_entity_bits::way, osmium::io::read_meta::no};
+            osmium::apply(reader15, node_collector);
+            reader15.close();
+            std::cerr << "    " << node_collector.collected_ways() << " ways collected" << std::endl;
+        }
+        auto pass15_secs = Duration(Clock::now() - pass15_start).count();
+        uint64_t needed_count = needed_nodes.count();
+        std::cerr << "  Pass 1.5 done (" << format_duration(pass15_secs)
+                  << ", " << needed_count << " needed nodes, bitmap "
+                  << needed_nodes.memory_mb() << " MB)" << std::endl;
+        log_mem("after pass 1.5");
+
+        // --- Pass 2: process all data with filtered node locations ---
         std::cerr << "  Pass 2: processing nodes, ways, and areas..." << std::endl;
         auto pass2_start = Clock::now();
 
         if (in_memory) {
             using index_type = osmium::index::map::SparseMemArray<
                 osmium::unsigned_object_id_type, osmium::Location>;
-            using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
             index_type index;
-            location_handler_type location_handler{index};
+            FilteredNodeLocationsForWays<index_type> location_handler{index, needed_nodes};
             location_handler.ignore_errors();
 
             osmium::io::Reader reader2{input_file, osmium::io::read_meta::no};
@@ -1270,15 +1423,17 @@ int main(int argc, char* argv[]) {
                 osmium::apply(buffer, handler);
             }));
             reader2.close();
+
+            std::cerr << "    Node locations: " << location_handler.stored() << " stored, "
+                      << location_handler.skipped() << " skipped" << std::endl;
         } else {
             using index_type = osmium::index::map::SparseFileArray<
                 osmium::unsigned_object_id_type, osmium::Location>;
-            using location_handler_type = osmium::handler::NodeLocationsForWays<index_type>;
 
             std::string tmp_path = (tmp_dir.empty() ? output_dir : tmp_dir) + "/node_locations.tmp";
             int fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
             index_type index{fd};
-            location_handler_type location_handler{index};
+            FilteredNodeLocationsForWays<index_type> location_handler{index, needed_nodes};
             location_handler.ignore_errors();
 
             osmium::io::Reader reader2{input_file, osmium::io::read_meta::no};
@@ -1288,7 +1443,12 @@ int main(int argc, char* argv[]) {
             reader2.close();
             close(fd);
             std::remove(tmp_path.c_str());
+
+            std::cerr << "    Node locations: " << location_handler.stored() << " stored, "
+                      << location_handler.skipped() << " skipped" << std::endl;
         }
+        needed_nodes.clear();
+        malloc_trim(0);
         auto pass2_secs = Duration(Clock::now() - pass2_start).count();
         auto file_secs = Duration(Clock::now() - file_start).count();
         std::cerr << "  Pass 2 done (" << format_duration(pass2_secs) << ", file total: " << format_duration(file_secs) << ")" << std::endl;
